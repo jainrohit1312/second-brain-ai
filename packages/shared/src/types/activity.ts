@@ -1,4 +1,5 @@
 import type { DeviceId } from './device';
+import type { DocumentSource } from './document';
 
 /**
  * Raw activity capture.
@@ -167,16 +168,78 @@ export type ActivityEvent =
   | DownloadEvent;
 
 /**
- * The wire format for a sync request. One batch is one device's queued events,
- * capped by `SYNC_BATCH_SIZE`. `schemaVersion` lets the server reject a client
- * it can no longer understand instead of silently mis-parsing it.
+ * A document body a client extracted and uploaded with a batch.
+ *
+ * Carried alongside `events` on the same {@link ActivityBatch} so one flush moves
+ * both halves of a capture: the events say *that* the user read something, the
+ * document says *what* they read. The two halves are independent — a batch may
+ * carry documents and no events — and they are deliberately not linked yet.
+ * Correlating them is a later phase, done by URL and timestamp at query time.
+ *
+ * Two fields a client might expect are absent on purpose:
+ *
+ * - There is no `contentHash`. The server computes it, because
+ *   `documents.content_hash` is the document's dedup identity under
+ *   `documents_user_content_hash_key`; a client-supplied hash would let a client
+ *   merge two documents it merely believes are identical.
+ * - There is no `metadata`. Nothing persists one, so the client may compute a
+ *   byline or an excerpt while building its draft but must not send them.
+ */
+export interface DocumentUpload {
+  /** As observed, before normalization. Required, and non-empty. */
+  url: string;
+  /** May be an empty string — `documents.title` is `not null default ''`. */
+  title: string;
+  /**
+   * The full readable text, already extracted by the client. Bounded at both ends:
+   * under 200 characters is not a document, and 500 000 is the body ceiling the
+   * ingestion contract's 4 MB limit is sized against.
+   *
+   * Stored verbatim as `documents.extracted_text` with `extraction_status` set to
+   * `succeeded`, because the client has already run extraction. A client that
+   * could not extract a body must not upload a document at all — the failure is
+   * recorded as an event, not as a document row with no text.
+   */
+  content: string;
+  /** BCP-47 tag; `null` when the client's detection was inconclusive. */
+  language: string | null;
+  /**
+   * Where the document came from. Browser captures send `'web'`; this is a
+   * `DocumentSource`, not a free string, because `documents_source_check` rejects
+   * anything outside the enum and the server would otherwise fail the insert.
+   */
+  source: DocumentSource;
+  /** Word count of `content`. At least 1 — see `documents_word_count_check`. */
+  wordCount: number;
+  /** ISO-8601 UTC. When the client captured it; becomes `documents.captured_at`. */
+  occurredAt: string;
+}
+
+/**
+ * The wire format for a sync request. One batch is one device's queued work, cut
+ * into two halves that are capped separately: events by `SYNC_BATCH_SIZE`, and
+ * documents by a much smaller per-batch limit, because a single document carries a
+ * whole page body where an event carries an excerpt.
+ *
+ * `schemaVersion` lets the server reject a client it can no longer understand
+ * instead of silently mis-parsing it.
  */
 export interface ActivityBatch {
   schemaVersion: number;
   deviceId: DeviceId;
   /** ISO-8601 UTC, from the client clock. Used to detect clock skew, not for ordering. */
   clientSentAt: string;
+  /**
+   * Queued events. May be empty when the batch carries at least one document: a
+   * flush whose only pending work is a document body still has to be sendable. A
+   * batch that is empty on both halves is rejected by the server.
+   */
   events: ActivityEvent[];
+  /**
+   * Extracted document bodies, at most 5 per batch. Omitted when the batch carries
+   * only events, which is the common case.
+   */
+  documents?: DocumentUpload[];
 }
 
 /**
@@ -185,6 +248,12 @@ export interface ActivityBatch {
  * Partial acceptance is deliberate: one malformed event must not discard the
  * other 99. `rejectedIds` is what the client uses to drop poison rows from its
  * local queue rather than retrying them forever.
+ *
+ * The document counters are separate rather than pooled into `accepted`,
+ * `rejected`, and `duplicates`. An event and a document are different units,
+ * validated differently, deduplicated on different keys, and counted against
+ * different caps — so one pair of counters covering both could never satisfy the
+ * invariants the server asserts.
  */
 export interface ActivityBatchResult {
   accepted: number;
@@ -193,6 +262,21 @@ export interface ActivityBatchResult {
   /** Opaque cursor the client stores in `DeviceSyncState.cursor`. */
   serverCursor: string;
   rejectedIds: string[];
+  /**
+   * Documents stored or refreshed by this batch. Every validated document counts,
+   * whether it created a row or matched an existing one through
+   * `documents_user_content_hash_key` and refreshed it.
+   */
+  documentsAccepted: number;
+  /** Documents that failed per-document validation. */
+  documentsRejected: number;
+  /**
+   * The urls to remove from the client's document queue. Kept apart from
+   * `rejectedIds` because those are event ids, and a document has no id until the
+   * server has hashed its content — the url is the only handle the client and the
+   * server both have at rejection time.
+   */
+  rejectedDocumentUrls: string[];
 }
 
 /** Why a single event was not accepted. */

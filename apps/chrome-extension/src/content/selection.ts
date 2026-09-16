@@ -14,9 +14,11 @@ import type { SelectionCapturePayload } from '@/types/events';
  * applies before the payload is ever built. Nothing is captured from a page the user
  * excluded, including the surrounding context.
  *
- * Phase 1a scope: both functions are implemented and unit-testable, but the page-view
- * tracker does not start the observer yet. Wiring selections in is Phase 2, where the
- * `selection` and `copy` event paths land together.
+ * Scope: both functions are wired. The content script starts `createSelectionObserver` and
+ * runs each payload through `buildSelectionDraft` in `./selection-draft`, which is where the
+ * draft is held to the runtime message schema. `copy` is the other half of this capture path
+ * and is not wired yet; when it lands it should reuse this privacy rule — the length floor
+ * and the exclusion check — rather than restating it.
  */
 
 /** Shorter selections are almost always UI noise: a mis-click, a label, a single word. */

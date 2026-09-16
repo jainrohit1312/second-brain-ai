@@ -239,6 +239,17 @@ Three gaps the phase-1 ingest path inherits or creates. Each is a behavioural di
 - [ ] **Nothing can enqueue the follow-up work.** There is no job-queue table among the nine phase-1 tables, so `process-activity` cannot schedule extraction for a row it just accepted, and the post-ingest push that the plumbing above depends on has nowhere to write. Design the queue first — table shape, claim semantics, retry/backoff columns, and the idempotency key a retried job relies on — then let the push and the sweep be thin clients of it. The phase-1 draft expected this to be `device_sync_state`, which is a **client-side type** in `@second-brain/shared`, not a table. See [ADR-022](./DECISIONS.md#adr-022-ingestion-runs-as-the-process-activity-edge-function).
 - [ ] **Two error envelopes are in the wild.** `process-activity` answers `{ error: { code, message, requestId } }` while `embed` and `distill` answer a flat `{ function, error, requestId }`, so a client that branches on `code` — `token_expired` wants a refresh, `device_revoked` wants capture stopped — works against one function and not the others. Unify on the documented envelope, including the `405` and `500` paths, and decide the same question for `internal_error` messages: `process-activity` returns a fixed string and logs the real one, while the other two echo `error.message`, which can name a table, a column, or a query.
 
+### `documents.last_seen_at` integrity gap — 2026-09-16
+
+`documents.last_seen_at` is writable by any signed-in user through the `documents_update_own` policy, because it is not in `documents_guard_immutable_columns`. The RPC upsert added in [ADR-023](./DECISIONS.md#adr-023-document-upserts-via-service_role-rpc-not-rls-client) relies on the column being writable, which is why it was not added to the trigger's list at the same time — the write path had to exist before the column could be locked down.
+
+Revisit when retention sweeps or staleness ranking land in a later phase — retention is [Phase 7](#phase-7--reranking-semantic-chunking-retention-hardening) above — at which point the value has to be server-authoritative:
+
+- **Option A:** a separate `server_updated_at` column that only the service role writes and the guard protects, leaving `last_seen_at` as a best-effort hint.
+- **Option B:** keep one column, and add a `USING` / `WITH CHECK` clause to `documents_update_own` — or a branch in `documents_guard_immutable_columns` — that ignores or rejects user-supplied changes to `last_seen_at` from non-`service_role` callers.
+
+Deferred because no current feature reads the value in order to decide anything, so a user-writable timestamp there is inert today. It is recorded rather than left implicit because the guard's documented invariant is that the mutable surface a user owns is `title`, `summary`, and `deleted_at` — and as it stands that sentence is no longer true of the table.
+
 ### Chrome extension capture paths (the Phase 1a remainder)
 
 Phase 1a wired one capture path end to end. These are the rest, in rough dependency order.

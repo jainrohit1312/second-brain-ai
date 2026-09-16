@@ -36,6 +36,7 @@ Status: draft — scaffold phase, no implementation yet. ADRs marked **Proposed*
 | [ADR-020](#adr-020-isolate-all-application-objects-in-a-dedicated-second_brain-schema-rather-than-public) | Isolate all application objects in a dedicated `second_brain` schema rather than `public` | Accepted |
 | [ADR-021](#adr-021-phase-1-pins-1024-dimension-embeddings-with-a-named-default-model)                     | Phase 1 pins 1024-dimension embeddings with a named default model                         | Accepted |
 | [ADR-022](#adr-022-ingestion-runs-as-the-process-activity-edge-function)                                  | Ingestion runs as the `process-activity` edge function, written by the service role       | Accepted |
+| [ADR-023](#adr-023-document-upserts-via-service_role-rpc-not-rls-client)                                  | Document upserts via `service_role` RPC, not an RLS client                                | Accepted |
 
 ---
 
@@ -1303,6 +1304,123 @@ The role question is settled by the migrations rather than by preference. `activ
 - **Write through the caller's JWT and add INSERT policies to `activity_events`.** Removes the service-role key from the path and lets RLS do the ownership check. Rejected for ADR-018's reason: validation would move into the client, and the exclusion invariant would end up enforced in two clients and a policy.
 - **Keep `services/ingestion` as the ingest server.** It is what the API document describes and it would leave the edge functions to background work alone. Rejected for phase 1 because it means running, deploying, and authenticating a second service before the capture loop can be exercised once; the edge function deploys code that already exists.
 - **Wait for register-device, and verify device secrets only once it ships.** Simpler and arguably more honest than a four-case rule. Rejected because the check would then be written twice — once as a missing feature and once for real — and the second version would be new, unreviewed code in a path that already works.
+
+## ADR-023: Document upserts via `service_role` RPC (not RLS client)
+
+**Status:** Accepted
+**Date:** 2026-09-16
+
+### Context
+
+`process-activity` now writes two kinds of row, and they do not want the same write
+statement. Activity events are idempotent by `(device_id, dedupe_key)`, and a replay is
+absorbed by `ON CONFLICT … DO NOTHING`. Documents are idempotent by
+`(user_id, content_hash)`, but a re-capture is not a no-op: the contract is
+`ON CONFLICT (user_id, content_hash) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at,
+title = EXCLUDED.title, url = EXCLUDED.url` — a named, three-column update set, with
+`captured_at` deliberately excluded because it means "first captured" and is the sort key
+of `documents_user_captured_id_idx`.
+
+Two shapes were considered for the document write:
+
+- **(a) A caller-bound client — anon key plus the user's JWT — upserting through
+  PostgREST.** This is the shape ADR-022 uses for the reads that feed an access decision.
+  It cannot be made to work for documents without a schema change: `documents` carries
+  `enable` *and* `force row level security` with deliberately no INSERT policy (ADR-018,
+  ADR-022), so an `authenticated` insert is refused with `42501` before any dedup logic
+  runs. Making it work means granting `authenticated` an INSERT policy on `documents`,
+  which is precisely the alternative ADR-018 rejected.
+- **(b) A dedicated RPC.** One entry point, granted to `service_role` alone, whose first
+  parameter is `user_id`.
+
+A second and narrower problem belongs to (a), and is recorded because it is the usual
+reason this shape gets chosen. PostgREST's only upsert mode is
+`Prefer: resolution=merge-duplicates`, which sets *every* column present in the payload;
+there is no option that names a subset. Under `merge-duplicates`, telling "created" apart
+from "refreshed" therefore relies on reading `xmax` back through the payload — `xmax = 0`
+for an insert, non-zero for an update — which is a property of a `SELECT`-list projection
+rather than a documented upsert feature.
+
+### Decision
+
+**Document writes go through `second_brain.upsert_document_captures`, granted to
+`service_role` only.** It takes `p_user_id`, `p_device_id`, and `p_documents` — a JSON
+array read through `jsonb_to_recordset` — and returns the number of documents it touched,
+counting both inserts and refreshes.
+
+- `p_user_id` is sourced inside the edge function from the verified caller JWT, and is
+  never read from a request body.
+- The update set is the contract's three columns, written in SQL, so no PostgREST
+  projection can widen it.
+- EXECUTE is revoked from `PUBLIC`, `anon`, and `authenticated` in the same migration that
+  creates the function, leaving `service_role` as the only caller.
+- The function is `security invoker`: the service role already bypasses RLS, and invoker
+  rights mean it can never do more than its caller could.
+
+### Rationale
+
+- **Both halves of a batch write as the service role; the asymmetry is the *statement*,
+  not the *role*.** ADR-022 already puts the service role behind every write to this
+  schema, with `user_id` from the JWT and an explicit filter on each statement. The
+  document write changes nothing about that boundary — only how the update set is
+  expressed, which PostgREST cannot express at all.
+- **The auth boundary is unchanged.** `service_role` bypasses RLS here exactly as it does
+  for `activity_events`, and the property that makes that safe is the one ADR-022 names:
+  `user_id` has a single source, the verified JWT.
+- **Events need no RPC, and are not converted to one.** Their idempotency is satisfiable
+  with `ON CONFLICT … DO NOTHING`, which PostgREST exposes as `ignoreDuplicates`, and that
+  path works today. Rewriting a working write to make the two halves look alike would be
+  symmetry for its own sake.
+- **One controlled entry point is a smaller surface than an RLS policy.** Option (a) would
+  have widened `authenticated`'s privileges on `documents` permanently, for the benefit of
+  one caller. Option (b) grants one execute privilege on one function.
+
+### Consequences
+
+- **Document writes depend on RPC availability.** Any change to the write's shape — a
+  column added to the update set, a change to the returned count — is a migration rather
+  than a client change, and `upsert_document_captures` and the edge function's
+  `UPSERT_DOCUMENTS_RPC` constant have to move together.
+- **The service-role grant must be maintained.** A later migration that revokes default
+  EXECUTE in this schema, or a `create or replace` that re-creates the function under a
+  different owner, can silently remove the ability to write documents — and the symptom is
+  a 500 on the document half of every batch, not a permission error a client can act on.
+- **The caller must collapse duplicate content hashes itself.** Two rows sharing a
+  `content_hash` in one statement raise `21000`, so the edge function deduplicates within
+  the batch before calling. This is an obligation the function does not and cannot check.
+- **The function will not resurrect a soft-deleted document.** A re-capture matching a row
+  with `deleted_at` set refreshes its `last_seen_at`, `title`, and `url`, and leaves
+  `deleted_at` alone. That is deliberate — "the user deleted this" is not a background
+  sync's decision to reverse — but it does mean such a re-capture silently changes nothing
+  the user can see.
+- **`last_seen_at` had to be added to `documents`** (`20260916098000`), and it is not in
+  `documents_guard_immutable_columns`, so `documents_update_own` currently lets a signed-in
+  user write it. Recorded as a Phase 2 gap in [TASKS.md](./TASKS.md) rather than fixed
+  here, because nothing yet depends on the value being server-authoritative.
+- **A future document write with different auth — per-user secrets, say (ADR-018) — may
+  need a different RPC**, since this one takes its authority from a `service_role` grant
+  rather than from the caller's own credentials.
+
+### Alternatives considered
+
+- **Grant `authenticated` an INSERT policy on `documents` and upsert through the caller's
+  client.** Keeps the service-role key out of this path and lets RLS do the ownership
+  check. Rejected for ADR-018's reason: it moves validation into the client, and it leaves
+  `authenticated` holding a standing INSERT privilege on a table whose insert path should
+  stay in one place.
+- **Insert with `ignoreDuplicates: true`, then update the pre-existing rows in a second
+  statement.** Expressible with today's tools and no migration: select the batch's existing
+  hashes, upsert the new ones, then update the rest with `{ last_seen_at, title, url }`.
+  Rejected because it is three round trips per batch instead of one and it is not atomic —
+  a concurrent batch can interleave between the select and the update. The interleaving is
+  benign (no duplicate rows), but the counting becomes subtle, and these counters are
+  asserted against the batch length.
+- **A plain `merge-duplicates` upsert with `captured_at` left out of the payload.** One
+  round trip, no migration, and `captured_at` survives a re-capture precisely because it is
+  absent from the update set. Rejected because it would then have to come from the column's
+  `now()` default, making a document's capture time the *sync* time rather than the
+  client's — so a queue draining hours late would record the wrong instant, which is the
+  failure the event path's clamping exists to avoid.
 
 ---
 

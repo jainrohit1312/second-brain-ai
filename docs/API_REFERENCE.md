@@ -254,7 +254,7 @@ Still unimplemented behind it: `/v1/ingest/batch` on `services/ingestion`, and t
 **Request body** — an `ActivityBatch`:
 
 ```ts
-type RequestBody = ActivityBatch; // { schemaVersion, deviceId, clientSentAt, events }
+type RequestBody = ActivityBatch; // { schemaVersion, deviceId, clientSentAt, events, documents? }
 ```
 
 ```json
@@ -292,6 +292,17 @@ type RequestBody = ActivityBatch; // { schemaVersion, deviceId, clientSentAt, ev
       "selectionLength": 104,
       "metadata": {}
     }
+  ],
+  "documents": [
+    {
+      "url": "https://example.com/ai-memory",
+      "title": "How recall systems are actually built",
+      "content": "Rank fusion is preferred to score interpolation because the two signals are not commensurable …",
+      "language": "en",
+      "source": "web",
+      "wordCount": 1840,
+      "occurredAt": "2026-09-16T09:14:02.000Z"
+    }
   ]
 }
 ```
@@ -301,9 +312,14 @@ Batch-level validation rules, applied before any per-event work:
 | Rule                                                     | On violation                                                                                                                            |
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `schemaVersion` must be an accepted value                | `400 unsupported_schema_version`                                                                                                        |
-| `events.length` must be 1–`SYNC_BATCH_SIZE`              | `400 bad_request` (over the limit ⇒ `413 payload_too_large`)                                                                            |
+| `events.length` must be 0–`SYNC_BATCH_SIZE`              | `400 bad_request` (over the limit ⇒ `413 payload_too_large`)                                                                            |
 | Every `event.deviceId` must equal the batch's `deviceId` | `400 validation_failed` — a batch is single-device by construction, and mixed-device batches cannot be authenticated against one secret |
 | `events` must be ordered by `occurredAt` ascending       | Not enforced; ordering is a client-side discipline, and the server stores `occurred_at` as given                                        |
+
+Two further batch rules govern the document half. They are stated here rather than as rows above, to leave that table's alignment undisturbed:
+
+- `documents.length` must be **0–5**. Over that is `413 payload_too_large`, the same code an over-long `events` array gets, because the remedy is the same one: split the batch and retry. The cap is far below `SYNC_BATCH_SIZE` because a single document carries a whole page body where a single event carries an excerpt.
+- `events` may be **empty** when `documents` holds at least one entry, so a flush whose only pending work is a document body can still be sent. A batch empty on _both_ halves is `400 validation_failed`: it carries no work, and answering `200` with a full set of zeroes would tell the client its queue had drained when nothing had been sent.
 
 **Response** — `200 OK`, an `ActivityBatchResult`:
 
@@ -313,7 +329,10 @@ Batch-level validation rules, applied before any per-event work:
   "rejected": 1,
   "duplicates": 0,
   "serverCursor": "c_0000000000000042",
-  "rejectedIds": ["019c4f2e-0837-7421-9c61-3ab4cde5f602"]
+  "rejectedIds": ["019c4f2e-0837-7421-9c61-3ab4cde5f602"],
+  "documentsAccepted": 1,
+  "documentsRejected": 0,
+  "rejectedDocumentUrls": []
 }
 ```
 
@@ -321,10 +340,16 @@ Batch-level validation rules, applied before any per-event work:
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `accepted`     | Newly inserted events.                                                                                                                                                                                                                                                               |
 | `duplicates`   | Events absorbed by the `(device_id, dedupe_key)` constraint. **Normal operation, not an error** — a retried batch looks like this.                                                                                                                                                   |
-| `rejected`     | Events that failed per-event validation. `accepted + rejected + duplicates` equals the batch length by construction, and there is a tested invariant for it.                                                                                                                         |
+| `rejected`     | Events that failed per-event validation. `accepted + rejected + duplicates` equals `events.length` by construction, and there is a tested invariant for it.                                                                                                                         |
 | `serverCursor` | The device's new watermark. Monotonic per device.                                                                                                                                                                                                                                    |
 | `rejectedIds`  | The ids to remove from the client queue.                                                                                                                                                                                                                                             |
 | _(missing)_    | Per-event rejection _reasons_ are deliberately **not** in the response, because they are not actionable by the client and would bloat every retry. The reason is logged server-side against the `requestId`. If a client needs reasons, that is a new field on a new schema version. |
+
+Three further fields describe the document half. They are listed here rather than as rows above for the same alignment reason:
+
+- **`documentsAccepted`** — documents stored or refreshed by this batch. Every validated document counts, whether it created a row or matched an existing one through `(user_id, content_hash)` and refreshed it. There is deliberately no `documentsDuplicates`: a re-capture is a success, not a no-op the client has to distinguish, and the client has nothing to do differently either way.
+- **`documentsRejected`** — documents that failed per-document validation.
+- **`rejectedDocumentUrls`** — the urls to remove from the client's document queue. Document rejections are deliberately **not** reported in `rejectedIds`, which carries event ids only: a document has no id, on the client or on the server, until its content has been hashed — so the url is the only handle both sides share.
 
 **Status codes**
 

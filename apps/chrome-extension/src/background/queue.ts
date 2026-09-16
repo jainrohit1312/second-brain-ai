@@ -1,20 +1,46 @@
+import type { DocumentDraft } from '@/types/events';
 import type { ActivityEvent } from '@second-brain/shared';
 
 /** IndexedDB database holding the durable outbound queue. */
 export const QUEUE_DB_NAME = 'second-brain-queue';
 /** Object store inside {@link QUEUE_DB_NAME}; one record per queued event, keyed by event id. */
 export const QUEUE_STORE_NAME = 'events';
-/** Schema version of the IndexedDB database; bump together with every store change. */
-export const QUEUE_DB_VERSION = 1;
+/**
+ * Object store inside {@link QUEUE_DB_NAME} holding queued document bodies, keyed by content
+ * hash. A second store rather than a second database: one connection and one upgrade path,
+ * and the two queues are drained together in a single batch.
+ */
+export const DOCUMENT_STORE_NAME = 'documents';
+/**
+ * Schema version of the IndexedDB database; bump together with every store change.
+ *
+ * Version 2 added the `documents` store. The upgrade creates a store only when it is
+ * missing and never clears an existing one, so an install that already holds queued events
+ * keeps every one of them.
+ */
+export const QUEUE_DB_VERSION = 2;
 /** Default `peekBatch` page size; the ingestion API rejects batches larger than 100. */
 export const DEFAULT_BATCH_LIMIT = 100;
-/** Events older than this are pruned during a flush; 7 days. */
+/**
+ * Default `peekDocumentBatch` page size. The ingestion contract caps documents at 5 per
+ * batch — far below the event cap, because one document carries a whole page body where one
+ * event carries an excerpt — so a larger page would be rejected rather than split.
+ */
+export const DEFAULT_DOCUMENT_BATCH_LIMIT = 5;
+/** Events older than this are pruned during a flush; 7 days. Documents use the same age. */
 export const DEFAULT_MAX_QUEUE_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 /** Hard depth cap. Above it the lowest-scoring events are evicted first. */
 export const MAX_QUEUE_DEPTH = 20_000;
 
 /** Non-unique index on `queuedAt`; the drain reads it ascending, the status view descending. */
 export const QUEUE_QUEUED_AT_INDEX = 'queuedAt';
+
+/**
+ * Non-unique index on `queuedAt` in the document store. The drain reads it ascending, so a
+ * `queuedAt`-ordered read is possible without the store's key order (content hash) leaking
+ * into the batch order.
+ */
+export const DOCUMENT_QUEUED_AT_INDEX = 'queuedAt';
 
 /**
  * An activity event plus the delivery bookkeeping the queue needs. `id` mirrors
@@ -28,6 +54,26 @@ export interface QueuedEvent {
   /** Failed sync attempts so far; drives backoff and the give-up rule. */
   attempts: number;
   /** ISO timestamp of the last attempt; null while the event is still pristine. */
+  lastAttemptAt: string | null;
+}
+
+/**
+ * A captured document body plus the delivery bookkeeping the queue needs.
+ *
+ * `id` is the SHA-256 of `document.content`, so two captures of the same text collapse onto
+ * one record instead of being sent twice. It is a **local** key only: the server's dedup
+ * identity for a document is its own `contentHash` over the same text, computed server-side
+ * precisely so a client cannot name it. The two values have the same job in different
+ * places and nothing ever compares them.
+ */
+export interface QueuedDocument {
+  id: string;
+  document: DocumentDraft;
+  /** ISO timestamp of the enqueue; drives FIFO order and age pruning. */
+  queuedAt: string;
+  /** Failed sync attempts so far. Documents are not retried selectively; kept for parity. */
+  attempts: number;
+  /** ISO timestamp of the last attempt; null while the document is still pristine. */
   lastAttemptAt: string | null;
 }
 
@@ -61,10 +107,43 @@ export interface QueueStore {
   clear(): Promise<void>;
   /** Drops events queued longer ago than `ms` and resolves with the number removed. */
   pruneOlderThan(ms: number): Promise<number>;
+
+  /** Persists one document and resolves with the stored record; no-op if its id is known. */
+  enqueueDocument(document: QueuedDocument): Promise<QueuedDocument>;
+  /** Returns up to `limit` oldest unacknowledged documents without mutating the queue. */
+  peekDocumentBatch(limit: number): Promise<QueuedDocument[]>;
+  /** Removes the given document ids and resolves with the number of records actually deleted. */
+  acknowledgeDocuments(ids: readonly string[]): Promise<number>;
+  /** Number of documents currently waiting. */
+  documentCount(): Promise<number>;
+  /** Drops every queued document; callers must confirm with the user first. */
+  clearDocuments(): Promise<void>;
+  /** Drops documents queued longer ago than `ms` and resolves with the number removed. */
+  pruneDocumentsOlderThan(ms: number): Promise<number>;
 }
 
-/** Opens (and upgrades) the queue database: one object store keyed by id, one `queuedAt` index. */
-function openQueueDb(dbName: string, storeName: string): Promise<IDBDatabase> {
+/** Creates one store and its `queuedAt` index, unless the store is already there. */
+function ensureStore(db: IDBDatabase, storeName: string, queuedAtIndex: string): void {
+  if (db.objectStoreNames.contains(storeName)) {
+    return;
+  }
+  const store = db.createObjectStore(storeName, { keyPath: 'id' });
+  store.createIndex(queuedAtIndex, 'queuedAt', { unique: false });
+}
+
+/**
+ * Opens (and upgrades) the queue database: one object store per queue kind, each keyed by
+ * `id` with its own `queuedAt` index.
+ *
+ * The upgrade is additive by construction — `ensureStore` only ever creates, and nothing is
+ * ever cleared — so an upgrade from version 1, which held the events store alone, leaves
+ * every queued event exactly where it was.
+ */
+function openQueueDb(
+  dbName: string,
+  eventStoreName: string,
+  documentStoreName: string,
+): Promise<IDBDatabase> {
   return new Promise<IDBDatabase>((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
       reject(new Error('IndexedDB is unavailable in this context; the queue cannot open.'));
@@ -75,11 +154,8 @@ function openQueueDb(dbName: string, storeName: string): Promise<IDBDatabase> {
 
     request.onupgradeneeded = () => {
       const db = request.result;
-      if (db.objectStoreNames.contains(storeName)) {
-        return;
-      }
-      const store = db.createObjectStore(storeName, { keyPath: 'id' });
-      store.createIndex(QUEUE_QUEUED_AT_INDEX, 'queuedAt', { unique: false });
+      ensureStore(db, eventStoreName, QUEUE_QUEUED_AT_INDEX);
+      ensureStore(db, documentStoreName, DOCUMENT_QUEUED_AT_INDEX);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error(`Cannot open ${dbName}`));
@@ -107,14 +183,20 @@ function transactionToPromise(transaction: IDBTransaction): Promise<void> {
   });
 }
 
-/** Reads up to `limit` records off a cursor, in the cursor's own direction. */
-function readCursor(
+/**
+ * Reads up to `limit` records off a cursor, in the cursor's own direction.
+ *
+ * Generic over the record type because the same walk serves the event store and the document
+ * store, which hold different shapes; what they share is the key and index layout, and that
+ * is all this function depends on.
+ */
+function readCursor<T>(
   store: IDBObjectStore,
   limit: number,
   direction: IDBCursorDirection,
   indexName?: string,
-): Promise<QueuedEvent[]> {
-  return new Promise<QueuedEvent[]>((resolve, reject) => {
+): Promise<T[]> {
+  return new Promise<T[]>((resolve, reject) => {
     if (limit <= 0) {
       resolve([]);
       return;
@@ -122,7 +204,7 @@ function readCursor(
 
     const source: IDBIndex | IDBObjectStore =
       indexName === undefined ? store : store.index(indexName);
-    const collected: QueuedEvent[] = [];
+    const collected: T[] = [];
     const request = source.openCursor(null, direction);
 
     request.onsuccess = () => {
@@ -131,7 +213,7 @@ function readCursor(
         resolve(collected);
         return;
       }
-      collected.push(cursor.value as QueuedEvent);
+      collected.push(cursor.value as T);
       cursor.continue();
     };
     request.onerror = () => reject(request.error ?? new Error('IndexedDB cursor failed'));
@@ -154,6 +236,7 @@ export class IndexedDbQueue implements QueueStore {
   constructor(
     readonly dbName: string = QUEUE_DB_NAME,
     readonly storeName: string = QUEUE_STORE_NAME,
+    readonly documentStoreName: string = DOCUMENT_STORE_NAME,
   ) {}
 
   async enqueue(event: ActivityEvent): Promise<QueuedEvent> {
@@ -284,10 +367,123 @@ export class IndexedDbQueue implements QueueStore {
     return removed;
   }
 
+  /**
+   * Persists one document, or returns the record already stored under the same id.
+   *
+   * Idempotent for the same reason `enqueue` is, and by the same mechanism: an id that is
+   * already present is returned untouched rather than re-written, so re-capturing text that
+   * is still queued cannot move it to the back of the FIFO by resetting `queuedAt`.
+   */
+  async enqueueDocument(document: QueuedDocument): Promise<QueuedDocument> {
+    const db = await this.#open();
+
+    return new Promise<QueuedDocument>((resolve, reject) => {
+      const transaction = db.transaction(this.documentStoreName, 'readwrite');
+      const store = transaction.objectStore(this.documentStoreName);
+      let result = document;
+
+      const lookup = store.get(document.id);
+      lookup.onsuccess = () => {
+        const existing = lookup.result as QueuedDocument | undefined;
+        if (existing !== undefined) {
+          result = existing;
+          return;
+        }
+        store.put(document);
+      };
+      lookup.onerror = () => reject(lookup.error ?? new Error('Document lookup failed'));
+
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = () => reject(transaction.error ?? new Error('Document write failed'));
+      transaction.onabort = () => reject(transaction.error ?? new Error('Document write aborted'));
+    });
+  }
+
+  async peekDocumentBatch(limit: number): Promise<QueuedDocument[]> {
+    const db = await this.#open();
+    const transaction = db.transaction(this.documentStoreName, 'readonly');
+    return readCursor<QueuedDocument>(
+      transaction.objectStore(this.documentStoreName),
+      limit,
+      'next',
+      DOCUMENT_QUEUED_AT_INDEX,
+    );
+  }
+
+  async acknowledgeDocuments(ids: readonly string[]): Promise<number> {
+    if (ids.length === 0) {
+      return 0;
+    }
+
+    const db = await this.#open();
+    let deleted = 0;
+
+    const transaction = db.transaction(this.documentStoreName, 'readwrite');
+    const store = transaction.objectStore(this.documentStoreName);
+
+    for (const id of ids) {
+      // Same presence check as `acknowledge`: `delete` succeeds on a missing key, so the
+      // count is only meaningful if the key was known to be there.
+      const lookup = store.getKey(id);
+      lookup.onsuccess = () => {
+        if (lookup.result === undefined) {
+          return;
+        }
+        const removal = store.delete(id);
+        removal.onsuccess = () => {
+          deleted += 1;
+        };
+      };
+    }
+
+    await transactionToPromise(transaction);
+    return deleted;
+  }
+
+  async documentCount(): Promise<number> {
+    const db = await this.#open();
+    const transaction = db.transaction(this.documentStoreName, 'readonly');
+    const count = await requestToPromise(transaction.objectStore(this.documentStoreName).count());
+    return count;
+  }
+
+  async clearDocuments(): Promise<void> {
+    const db = await this.#open();
+    const transaction = db.transaction(this.documentStoreName, 'readwrite');
+    transaction.objectStore(this.documentStoreName).clear();
+    await transactionToPromise(transaction);
+  }
+
+  async pruneDocumentsOlderThan(ms: number): Promise<number> {
+    const cutoff = new Date(Date.now() - ms).toISOString();
+    const db = await this.#open();
+    let removed = 0;
+
+    const transaction = db.transaction(this.documentStoreName, 'readwrite');
+    const store = transaction.objectStore(this.documentStoreName);
+    const range = IDBKeyRange.upperBound(cutoff, true);
+    const request = store.index(DOCUMENT_QUEUED_AT_INDEX).openCursor(range);
+
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor === null) {
+        return;
+      }
+      const removal = cursor.delete();
+      removal.onsuccess = () => {
+        removed += 1;
+      };
+      cursor.continue();
+    };
+
+    await transactionToPromise(transaction);
+    return removed;
+  }
+
   /** Opens the connection once per instance, dropping it when the database is replaced. */
   #open(): Promise<IDBDatabase> {
     if (this.#connection === null) {
-      this.#connection = openQueueDb(this.dbName, this.storeName)
+      this.#connection = openQueueDb(this.dbName, this.storeName, this.documentStoreName)
         .then((db) => {
           db.onversionchange = () => {
             db.close();

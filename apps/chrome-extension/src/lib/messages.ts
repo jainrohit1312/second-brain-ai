@@ -144,6 +144,25 @@ const selectionCapturePayloadSchema = z.object({
 });
 
 /**
+ * An extracted page body, as the content script sends it.
+ *
+ * Validated for the same reason the event drafts are: the router writes what it accepts
+ * straight into a durable store, so a malformed body would be persisted and retried until the
+ * server rejected it. `content` is deliberately unvalued here — its length floor is the
+ * server's rule (200 characters), and duplicating it would be a second threshold to keep in
+ * sync with `DOCUMENT_MIN_CHARS`.
+ */
+const documentDraftSchema = z.object({
+  url: z.string(),
+  title: z.string(),
+  content: z.string(),
+  language: nullableStringSchema,
+  source: z.literal('web'),
+  wordCount: z.number(),
+  occurredAt: isoTimestampSchema,
+});
+
+/**
  * The live validator for {@link RuntimeMessage}.
  *
  * Typed against `RuntimeMessageSchema`, which is `ZodType<RuntimeMessage>` — if a schema
@@ -158,6 +177,7 @@ export const runtimeMessageSchema: RuntimeMessageSchema = z.discriminatedUnion('
   z.object({ type: z.literal('SET_CAPTURE_ENABLED'), enabled: z.boolean() }),
   z.object({ type: z.literal('AUTH_STATE_CHANGED'), auth: authStateSnapshotSchema }),
   z.object({ type: z.literal('CAPTURE_SELECTION'), selection: selectionCapturePayloadSchema }),
+  z.object({ type: z.literal('DOCUMENT_CAPTURED'), document: documentDraftSchema }),
   z.object({ type: z.literal('ASK_QUESTION'), question: z.string(), mode: chatModeSchema }),
 ]);
 

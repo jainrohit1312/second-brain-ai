@@ -9,9 +9,13 @@ import { isAuthRequiredError, requireAuth } from '@/lib/auth';
 import { bumpDroppedCount, writeLastSync } from '@/lib/settings';
 import { DEFAULT_SYNC_INTERVAL_SECONDS, readExtensionEnv } from '@/lib/supabase';
 
-import { DEFAULT_BATCH_LIMIT, DEFAULT_MAX_QUEUE_AGE_MS } from './queue';
+import {
+  DEFAULT_BATCH_LIMIT,
+  DEFAULT_DOCUMENT_BATCH_LIMIT,
+  DEFAULT_MAX_QUEUE_AGE_MS,
+} from './queue';
 
-import type { QueueStore, QueuedEvent } from './queue';
+import type { QueueStore, QueuedDocument, QueuedEvent } from './queue';
 import type { FlushReason, SyncOutcome } from '@/types/events';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -90,13 +94,21 @@ export function computeBackoffMs(attempt: number): number {
   return Math.min(BASE_BACKOFF_MS * 2 ** step, MAX_BACKOFF_MS);
 }
 
-/** Wraps queued events in the wire envelope the ingestion endpoint expects. */
+/**
+ * Wraps queued events and documents in the wire envelope the ingestion endpoint expects.
+ *
+ * `documents` is omitted rather than sent empty when there are none. The server accepts an
+ * empty array, but omitting it keeps an events-only batch byte-identical to what this client
+ * sent before documents existed — which is what makes the document half additive to the path
+ * that already works, rather than a change to it.
+ */
 export function buildActivityBatch(
   events: readonly QueuedEvent[],
+  documents: readonly QueuedDocument[],
   deviceId: DeviceId,
   now: () => Date = () => new Date(),
 ): ActivityBatch {
-  return {
+  const batch: ActivityBatch = {
     // Stamped from the shared constant rather than from the caller: a batch built
     // with a version this build does not understand is rejected outright by the
     // server, and the shared constant is the one place that knows the current one.
@@ -107,6 +119,12 @@ export function buildActivityBatch(
     clientSentAt: now().toISOString(),
     events: events.map((queued) => queued.event),
   };
+
+  if (documents.length > 0) {
+    batch.documents = documents.map((queued) => queued.document);
+  }
+
+  return batch;
 }
 
 /**
@@ -184,6 +202,11 @@ function describeError(error: unknown): string {
  * {@link SyncOutcome} on every path, including "nothing to do" and "not signed in" — a
  * drain is not an exceptional event, so it never rejects.
  *
+ * Both queues drain in the same batch. `ActivityBatch` carries events and documents as two
+ * halves of one payload, so sending them separately would be two round trips for work a single
+ * request accepts — and because the server caps documents per batch, the document half
+ * catches up five at a time on the timer rather than in a burst.
+ *
  * One batch per call, not a loop until empty. `SyncOutcome` carries a single
  * `ActivityBatchResult`, and the drain runs on a timer, on idle, and on the post-capture
  * threshold, so a deep queue catches up over several ticks rather than holding a worker
@@ -229,6 +252,10 @@ export async function flushQueue(
     if (pruned > 0) {
       await bumpDroppedCount(pruned);
     }
+    const prunedDocuments = await store.pruneDocumentsOlderThan(DEFAULT_MAX_QUEUE_AGE_MS);
+    if (prunedDocuments > 0) {
+      await bumpDroppedCount(prunedDocuments);
+    }
   } catch (error) {
     console.warn('[second-brain] queue prune failed', error);
   }
@@ -243,17 +270,22 @@ export async function flushQueue(
   }
 
   let batch: QueuedEvent[];
+  let documents: QueuedDocument[];
   try {
     batch = await store.peekBatch(DEFAULT_BATCH_LIMIT);
+    documents = await store.peekDocumentBatch(DEFAULT_DOCUMENT_BATCH_LIMIT);
   } catch (error) {
     return finish({ status: 'failed', sent: 0, result: null, error: describeError(error) });
   }
 
-  if (batch.length === 0) {
+  // Both halves empty is the only "nothing to do" case. A drain with documents and no events
+  // is a real drain — the wire contract lets a batch carry documents alone — which is why
+  // this is not simply `batch.length === 0`.
+  if (batch.length === 0 && documents.length === 0) {
     return finish({ status: 'skipped', sent: 0, result: null, error: null });
   }
 
-  const envelope = buildActivityBatch(batch, deps.deviceId, deps.now);
+  const envelope = buildActivityBatch(batch, documents, deps.deviceId, deps.now);
 
   try {
     const result = await postActivityBatch(deps.client, envelope);
@@ -277,15 +309,43 @@ export async function flushQueue(
       );
     }
 
+    // Documents are matched by url, because that is all the server reports: a document has no
+    // id on either side until its content is hashed, and the id this queue keys on is a hash
+    // of a different algorithm. The consequence to know is that two documents in one batch
+    // sharing a url are dropped together — correct if the server rejected that url, wrong if
+    // it rejected one for a reason the url does not distinguish.
+    const rejectedUrls = new Set(result.rejectedDocumentUrls);
+    const acceptedDocumentIds = documents
+      .filter((queued) => !rejectedUrls.has(queued.document.url))
+      .map((queued) => queued.id);
+    if (acceptedDocumentIds.length > 0) {
+      await store.acknowledgeDocuments(acceptedDocumentIds);
+    }
+
+    const rejectedDocumentIds = documents
+      .filter((queued) => rejectedUrls.has(queued.document.url))
+      .map((queued) => queued.id);
+    if (rejectedDocumentIds.length > 0) {
+      await store.acknowledgeDocuments(rejectedDocumentIds);
+      // Counted as dropped rather than removed quietly: a rejected document is a whole page
+      // body the user cannot get back, and the popup's counter is the only place that loss
+      // becomes visible.
+      await bumpDroppedCount(rejectedDocumentIds.length);
+      console.warn(
+        `[second-brain] server rejected ${rejectedDocumentIds.length} document(s); dropped from the queue`,
+      );
+    }
+
     return finish({
-      status: result.rejected > 0 ? 'partial' : 'ok',
+      status: result.rejected > 0 || result.documentsRejected > 0 ? 'partial' : 'ok',
       sent: batch.length,
       result,
       error: null,
     });
   } catch (error) {
-    // Nothing is acknowledged: every event in the batch is still queued and will be
-    // re-sent, which the server's `(deviceId, dedupeKey)` constraint makes harmless.
+    // Nothing is acknowledged: every event and document in the batch is still queued and will
+    // be re-sent, which the server's `(device_id, dedupe_key)` and `(user_id, content_hash)`
+    // constraints make harmless.
     return finish({
       status: 'failed',
       sent: batch.length,

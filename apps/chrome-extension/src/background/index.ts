@@ -1,4 +1,4 @@
-import { EXPLICIT_INTENT_EVENT_TYPES, isWorkingHours } from '@second-brain/shared';
+import { EXPLICIT_INTENT_EVENT_TYPES, sha256Hex } from '@second-brain/shared';
 
 import { getSession, toAuthStateSnapshot } from '@/lib/auth';
 import { RecentKeyRing, contentDedupeKey } from '@/lib/dedup';
@@ -16,6 +16,7 @@ import {
   writeCaptureEnabled,
   writeCapturePaused,
 } from '@/lib/settings';
+import { deriveSignals } from '@/lib/signals';
 import { createExtensionClient } from '@/lib/supabase';
 
 import { isIdleFlushDue, startIdleWatch, stopIdleWatch } from './idle';
@@ -29,6 +30,7 @@ import type {
   CaptureDecision,
   CapturedEventDraft,
   ContentScriptCommand,
+  DocumentDraft,
   ExtensionStatus,
   FlushReason,
   QueueStatus,
@@ -38,7 +40,7 @@ import type {
   SyncOutcome,
   SyncStatusSnapshot,
 } from '@/types/events';
-import type { ActivityEvent, DeviceId, ImportanceSignals } from '@second-brain/shared';
+import type { ActivityEvent, DeviceId } from '@second-brain/shared';
 
 /**
  * Manifest V3 service worker entry point.
@@ -59,6 +61,15 @@ export const queue: QueueStore = new IndexedDbQueue();
 
 /** Above this depth a capture triggers an immediate flush instead of waiting for the alarm. */
 export const BATCH_FLUSH_THRESHOLD = 90;
+
+/**
+ * Documents above which a capture triggers an immediate flush. Far below
+ * {@link BATCH_FLUSH_THRESHOLD} because the two queues are capped differently: the server
+ * takes at most five documents per batch, so a sixth body cannot leave until the next drain
+ * and waiting for the alarm would simply let the document store grow behind a batch that is
+ * already full.
+ */
+export const DOCUMENT_FLUSH_THRESHOLD = 5;
 
 /** Dedupe ring for this worker instance; see the module note above. */
 const recentKeys = new RecentKeyRing();
@@ -167,36 +178,6 @@ function draftText(draft: CapturedEventDraft): string | null {
   }
 }
 
-/**
- * The subset of `ImportanceSignals` this client can actually observe.
- *
- * `isUniqueDomain`, `revisitCount`, and `topicNovelty` all need history the client does not
- * have in Phase 1a — the first two would come from `chrome.history` and the third only from
- * the server's own corpus — so they stay at zero. That makes the pre-filter conservative:
- * it never invents importance it cannot justify, and the server re-scores every accepted
- * event with the full signal vector anyway.
- */
-function deriveSignals(draft: CapturedEventDraft, at: Date): ImportanceSignals {
-  return {
-    dwellSeconds: draft.type === 'page_view' ? Math.max(0, draft.durationMs / 1_000) : 0,
-    scrollDepthPct: draft.type === 'page_view' ? draft.scrollDepthPct : 0,
-    isUniqueDomain: false,
-    revisitCount: 0,
-    wordCount: draft.type === 'page_read' ? draft.wordCount : 0,
-    hasSelection: draft.type === 'selection',
-    hasCopy: draft.type === 'copy',
-    isBookmarked: draft.type === 'bookmark',
-    isDownloaded: draft.type === 'download',
-    youtubeWatchedPct: draft.type === 'youtube_watch' ? draft.watchedPct : 0,
-    // Never set here: an excluded origin never produces a draft at all, because the content
-    // script applies the exclusion list before the event object is constructed. This field
-    // stays false as a deliberate invariant, not as missing wiring.
-    appIsExcluded: false,
-    isWorkingHours: isWorkingHours(at),
-    topicNovelty: 0,
-  };
-}
-
 /** Completes a draft into the event the server accepts, minting the four worker-only fields. */
 function mintEvent(
   draft: CapturedEventDraft,
@@ -272,11 +253,48 @@ async function handleEventCaptured(draft: CapturedEventDraft): Promise<CaptureDe
   return { queued: true, reason: null, importance: score.value, band: score.band };
 }
 
+/**
+ * Queues one extracted document body.
+ *
+ * The id is the SHA-256 of `content`, so the store is idempotent on the text rather than on
+ * the page: re-capturing the same article collapses onto the record already queued instead of
+ * sending the body twice.
+ *
+ * `sha256Hex` needs `crypto.subtle`, which is the reason this runs here rather than in the
+ * content script. A content script is injected into whatever the user is browsing, including
+ * plain `http://` origins where `crypto.subtle` does not exist, while a service worker is
+ * always a secure context.
+ *
+ * No score is consulted and no threshold is applied. A document exists only because the
+ * content script already decided the page was worth the cost of extracting it, and a cheap
+ * length floor here would be a second gate that has to stay aligned with the first — the same
+ * failure mode `selection-draft.ts` avoids on the other side. `enqueueDocument` absorbs a
+ * repeat, which is the only deduplication this path needs.
+ */
+async function handleDocumentCaptured(document: DocumentDraft): Promise<AckResponse> {
+  const id = await sha256Hex(document.content);
+
+  await queue.enqueueDocument({
+    id,
+    document,
+    queuedAt: new Date().toISOString(),
+    attempts: 0,
+    lastAttemptAt: null,
+  });
+
+  if ((await queue.documentCount()) >= DOCUMENT_FLUSH_THRESHOLD) {
+    void flushForSync('batch-full');
+  }
+
+  return { ok: true, error: null };
+}
+
 /** Queue depth, oldest/newest stamps, the drop counter, and the pause state. */
 async function collectQueueStatus(): Promise<QueueStatus> {
-  const [depth, oldest, newest, droppedCount, captureEnabled, capturePaused, lastSync] =
+  const [depth, documentsQueued, oldest, newest, droppedCount, captureEnabled, capturePaused, lastSync] =
     await Promise.all([
       queue.size(),
+      queue.documentCount(),
       queue.peekBatch(1),
       queue.peekNewest(1),
       readDroppedCount(),
@@ -292,6 +310,7 @@ async function collectQueueStatus(): Promise<QueueStatus> {
 
   return {
     depth,
+    documentsQueued,
     oldestQueuedAt: oldest[0]?.queuedAt ?? null,
     newestQueuedAt: newest[0]?.queuedAt ?? null,
     droppedCount,
@@ -302,8 +321,12 @@ async function collectQueueStatus(): Promise<QueueStatus> {
 
 /** The cheap half of the status: for refreshes that will not render the rest. */
 async function collectSyncStatus(): Promise<SyncStatusSnapshot> {
-  const [queueDepth, lastSync] = await Promise.all([queue.size(), readLastSync()]);
-  return { queueDepth, lastSync };
+  const [queueDepth, documentsQueued, lastSync] = await Promise.all([
+    queue.size(),
+    queue.documentCount(),
+    readLastSync(),
+  ]);
+  return { queueDepth, documentsQueued, lastSync };
 }
 
 /** Everything the popup and side panel render. */
@@ -336,14 +359,18 @@ async function applyCaptureEnabled(enabled: boolean): Promise<AckResponse> {
  * Dispatch table for the extension-internal protocol. The router validates the incoming
  * message against `runtimeMessageSchema` before looking it up.
  *
- * `CAPTURE_SELECTION` and `ASK_QUESTION` are deliberately absent: selection capture is not
- * wired in Phase 1a and retrieval is Phase 4, so the router answers both with a plain
- * refusal rather than a payload shaped like a decision it did not make.
+ * `CAPTURE_SELECTION` and `ASK_QUESTION` are deliberately absent. Selection capture is
+ * push-based and needs nothing from this table — the content script's observer and its copy
+ * listener build their drafts and send them as `EVENT_CAPTURED`, so a `CAPTURE_SELECTION`
+ * handler would be a second way to record the same thing, driven by a command the worker
+ * never sends. Retrieval is Phase 4. The router answers both with a plain refusal rather than
+ * a payload shaped like a decision it did not make.
  */
 export const messageHandlers: {
   [T in RuntimeMessageType]?: MessageHandler<T>;
 } = {
   EVENT_CAPTURED: (message) => handleEventCaptured(message.draft),
+  DOCUMENT_CAPTURED: (message) => handleDocumentCaptured(message.document),
   FLUSH_QUEUE: (message) => flushForSync(message.reason),
   SYNC_NOW: () => flushForSync('manual'),
   GET_STATUS: () => collectStatus(),

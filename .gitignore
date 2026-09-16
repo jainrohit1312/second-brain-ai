@@ -56,6 +56,11 @@ coverage/
 .nyc_output/
 *.lcov
 
+# Agent scratch space (Qwen Code). Verification scripts, temp copies and extracted
+# fragments live here and are never part of the tree. `.qwen/` itself stays
+# committable, because it is also where shared workflows, skills and settings go.
+.qwen/tmp/
+
 # Editor / OS
 .DS_Store
 Thumbs.db

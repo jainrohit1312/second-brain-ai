@@ -389,6 +389,10 @@ One row per distinct piece of content the user has encountered, deduplicated by 
 
 **Trigger `documents_guard_immutable_columns`** (before update): rejects changes to `user_id`, `content_hash`, `extracted_text`, `word_count`, `reading_time_seconds`, `source`, `captured_at`, and `extraction_status` unless running as the service role. The mutable surface a user owns is `title`, `summary`, and `deleted_at`. Without this trigger, `documents_update_own` would let a user rewrite `extracted_text`, which would silently orphan every chunk derived from it.
 
+**Later addition — `last_seen_at`.** `20260916098000_add_last_seen_at_to_documents.sql` adds a `last_seen_at` column (`timestamptz`, `not null`, `default now()`) that the column table above does not list, because that table mirrors the original DDL rather than every later migration. It records when a document was most recently captured again, and is refreshed by the `process-activity` edge function's upsert on `(user_id, content_hash)` rather than inserting a second row. It is deliberately separate from `captured_at`, which means "first captured", is server-owned and guarded, and is the sort key of `documents_user_captured_id_idx` — overwriting it on a re-capture would reorder the user's history.
+
+`last_seen_at` is **not** in the guarded column list above, which is a known gap rather than an intentional one: the documented mutable surface a user owns is `title`, `summary`, and `deleted_at`, so as it stands `documents_update_own` lets a signed-in user set this column through PostgREST. Nothing in the product does that today — ADR-018 and ADR-022 keep the extension off PostgREST entirely — so this is latent, not live. It is recorded here instead of being widened silently; the fix is a one-line change to `documents_guard_immutable_columns` in a later migration.
+
 ## `document_chunks`
 
 One retrievable passage. This is the vector-search surface and, with `memories`, one of the two things retrieval actually reads.

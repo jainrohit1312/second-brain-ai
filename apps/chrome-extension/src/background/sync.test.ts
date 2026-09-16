@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { INGEST_FUNCTION_NAME, postActivityBatch } from './sync';
+import { INGEST_FUNCTION_NAME, buildActivityBatch, postActivityBatch } from './sync';
 
+import type { QueuedDocument, QueuedEvent } from './queue';
 import type { ActivityBatch, ActivityBatchResult } from '@second-brain/shared';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -30,6 +31,9 @@ const RESULT: ActivityBatchResult = {
   duplicates: 0,
   serverCursor: 'eyJ2IjoxLCJ0Ijoic3luYyJ9',
   rejectedIds: [],
+  documentsAccepted: 0,
+  documentsRejected: 0,
+  rejectedDocumentUrls: [],
 };
 
 /**
@@ -113,5 +117,86 @@ describe('postActivityBatch', () => {
     const { client } = clientAnswering({ data: withoutRejectedIds, error: null });
 
     await expect(postActivityBatch(client, BATCH)).rejects.toThrow(/not acknowledged/);
+  });
+});
+
+/** One queued event, for the envelope tests below. */
+const EVENT: QueuedEvent = {
+  id: '019c4f2e-0837-7421-9c61-3ab4cde5f601',
+  queuedAt: '2026-09-16T09:15:00.000Z',
+  attempts: 0,
+  lastAttemptAt: null,
+  event: {
+    id: '019c4f2e-0837-7421-9c61-3ab4cde5f601',
+    deviceId: '0b5f0f3a-5c4b-4f0e-9a1e-6b0f6a2c9d31',
+    type: 'page_view',
+    occurredAt: '2026-09-16T09:12:00.000Z',
+    importance: 0.41,
+    dedupeKey: 'page_view:example.com/ai-memory:2026-09-16T09',
+    url: 'https://example.com/ai-memory',
+    title: 'How recall systems are actually built',
+    metadata: {},
+    domain: 'example.com',
+    durationMs: 184_000,
+    scrollDepthPct: 86,
+  },
+};
+
+/** One queued document body, for the envelope tests below. */
+const DOCUMENT: QueuedDocument = {
+  id: 'c'.repeat(64),
+  queuedAt: '2026-09-16T09:16:00.000Z',
+  attempts: 0,
+  lastAttemptAt: null,
+  document: {
+    url: 'https://example.com/ai-memory',
+    title: 'How recall systems are actually built',
+    content: 'Rank fusion is preferred to score interpolation.',
+    language: 'en',
+    source: 'web',
+    wordCount: 8,
+    occurredAt: '2026-09-16T09:14:02.000Z',
+  },
+};
+
+const CLOCK = (): Date => new Date('2026-09-16T09:20:00.000Z');
+const DEVICE = '0b5f0f3a-5c4b-4f0e-9a1e-6b0f6a2c9d31';
+
+/**
+ * The document half of the wire envelope.
+ *
+ * `buildActivityBatch` is the only place the client decides whether a batch carries documents,
+ * and the rule it applies — omit the field rather than send an empty array — is what keeps an
+ * events-only batch byte-identical to the one this client sent before documents existed. A
+ * regression would not fail loudly anywhere: the server tolerates both shapes, so the only
+ * symptom would be a field appearing in requests that no earlier release ever sent.
+ */
+describe('buildActivityBatch', () => {
+  it('carries the events, and omits `documents` entirely when there are none', () => {
+    const batch = buildActivityBatch([EVENT], [], DEVICE, CLOCK);
+
+    expect(batch.events).toEqual([EVENT.event]);
+    expect('documents' in batch).toBe(false);
+  });
+
+  it('omits `documents` when the array is given but empty', () => {
+    const batch = buildActivityBatch([], [], DEVICE, CLOCK);
+
+    expect('documents' in batch).toBe(false);
+  });
+
+  it('carries the document bodies when there are some, even with no events', () => {
+    const batch = buildActivityBatch([], [DOCUMENT], DEVICE, CLOCK);
+
+    expect(batch.events).toEqual([]);
+    expect(batch.documents).toEqual([DOCUMENT.document]);
+  });
+
+  it('stamps the schema version and the injected clock rather than the wall clock', () => {
+    const batch = buildActivityBatch([], [DOCUMENT], DEVICE, CLOCK);
+
+    expect(batch.schemaVersion).toBe(1);
+    expect(batch.deviceId).toBe(DEVICE);
+    expect(batch.clientSentAt).toBe('2026-09-16T09:20:00.000Z');
   });
 });

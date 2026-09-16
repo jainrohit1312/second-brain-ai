@@ -42,6 +42,7 @@ const SIGNED_OUT_SNAPSHOT: AuthStateSnapshot = {
 export const EMPTY_POPUP_VIEW: PopupViewModel = {
   queue: {
     depth: 0,
+    documentsQueued: 0,
     oldestQueuedAt: null,
     newestQueuedAt: null,
     droppedCount: 0,
@@ -126,7 +127,11 @@ function usePopupStatus(): PopupStatusState {
         if (!active) return;
         setView((previous) => ({
           ...previous,
-          queue: { ...previous.queue, depth: snapshot.queueDepth },
+          queue: {
+            ...previous.queue,
+            depth: snapshot.queueDepth,
+            documentsQueued: snapshot.documentsQueued,
+          },
           lastSync: snapshot.lastSync,
         }));
       } catch {
@@ -409,6 +414,10 @@ function SignedInScreen({ status }: SignedInScreenProps): JSX.Element {
         <div className="stats__row">
           <dt>Queued</dt>
           <dd>{view.queue.depth}</dd>
+        </div>
+        <div className="stats__row">
+          <dt>Documents</dt>
+          <dd>{view.queue.documentsQueued}</dd>
         </div>
         <div className="stats__row">
           <dt>Oldest</dt>

@@ -44,11 +44,20 @@ export interface AuthStateSnapshot {
 export interface QueueStatus {
   /** Events waiting in IndexedDB. */
   depth: number;
+  /**
+   * Document bodies waiting in IndexedDB, in a store of their own. Counted separately from
+   * `depth` because they are a different kind of thing — one row here is a whole page body,
+   * not an excerpt — and because the server caps them at five per batch rather than a hundred.
+   */
+  documentsQueued: number;
   /** ISO timestamp of the oldest queued event; null when the queue is empty. */
   oldestQueuedAt: string | null;
   /** ISO timestamp of the newest queued event; null when the queue is empty. */
   newestQueuedAt: string | null;
-  /** Events dropped locally since install (below threshold, duplicate, or over capacity). */
+  /**
+   * Events and documents dropped locally since install — below threshold, duplicate, over
+   * capacity, or rejected by the server and therefore dropped from the queue to unblock it.
+   */
   droppedCount: number;
   /** True while capture is paused by the user, an exclusion rule, or an idle lock. */
   isPaused: boolean;
@@ -89,6 +98,8 @@ export interface ExtensionStatus {
 export interface SyncStatusSnapshot {
   /** Events waiting in IndexedDB. */
   queueDepth: number;
+  /** Document bodies waiting in IndexedDB; see {@link QueueStatus.documentsQueued}. */
+  documentsQueued: number;
   lastSync: SyncOutcome | null;
 }
 
@@ -113,6 +124,32 @@ export interface SelectionCapturePayload {
   title: string | null;
 }
 
+/**
+ * An extracted page body, as the content script sends it to the service worker.
+ *
+ * The content script is the only side that can produce this: Readability needs the live DOM,
+ * which the service worker has no access to, and the whole point of extracting there is that
+ * the raw DOM never leaves the page.
+ *
+ * Two fields a reader might expect are deliberately absent. There is no `contentHash`: the
+ * server computes the document's dedup identity from `content`, because a client-named
+ * identity would let a client merge two documents it merely believes are identical. And
+ * there is no `metadata`, because nothing persists one.
+ *
+ * `source` is narrowed to `'web'` rather than the shared `DocumentSource` union, which is
+ * honest about what this client can produce — a browser capture is a web capture — and it
+ * still satisfies the shared wire type, whose `source` accepts it.
+ */
+export interface DocumentDraft {
+  url: string;
+  title: string;
+  content: string;
+  language: string | null;
+  source: 'web';
+  wordCount: number;
+  occurredAt: string;
+}
+
 /** Generic acknowledgement for messages that carry no payload of their own. */
 export interface AckResponse {
   ok: boolean;
@@ -129,6 +166,7 @@ export interface RuntimeResponseByType {
   SET_CAPTURE_ENABLED: AckResponse;
   AUTH_STATE_CHANGED: AckResponse;
   CAPTURE_SELECTION: CaptureDecision;
+  DOCUMENT_CAPTURED: AckResponse;
   ASK_QUESTION: { accepted: boolean; questionId: string };
 }
 
@@ -142,6 +180,7 @@ export type RuntimeMessage =
   | { type: 'SET_CAPTURE_ENABLED'; enabled: boolean }
   | { type: 'AUTH_STATE_CHANGED'; auth: AuthStateSnapshot }
   | { type: 'CAPTURE_SELECTION'; selection: SelectionCapturePayload }
+  | { type: 'DOCUMENT_CAPTURED'; document: DocumentDraft }
   | { type: 'ASK_QUESTION'; question: string; mode: ChatMode };
 
 /** Union of valid discriminants, handy for building a dispatch table. */

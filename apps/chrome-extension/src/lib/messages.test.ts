@@ -84,6 +84,49 @@ describe('parseRuntimeMessage', () => {
 
     expect(parseRuntimeMessage({ type: 'EVENT_CAPTURED', draft })).toBeNull();
   });
+
+  it('accepts a document body from the content script', () => {
+    const document = {
+      url: 'https://example.com/ai-memory',
+      title: 'How recall systems are actually built',
+      content: 'Rank fusion is preferred to score interpolation.',
+      language: 'en',
+      source: 'web',
+      wordCount: 8,
+      occurredAt: '2026-09-16T09:14:02.000Z',
+    };
+
+    expect(parseRuntimeMessage({ type: 'DOCUMENT_CAPTURED', document })).not.toBeNull();
+  });
+
+  it('refuses a document whose source is not one this client can produce', () => {
+    // `'chrome'` is the value that reads as obvious and that `documents_source_check` rejects;
+    // the schema refuses it here rather than letting the server fail the whole batch for it.
+    const document = {
+      url: 'https://example.com/a',
+      title: '',
+      content: 'x',
+      language: null,
+      source: 'chrome',
+      wordCount: 1,
+      occurredAt: '2026-09-16T09:14:02.000Z',
+    };
+
+    expect(parseRuntimeMessage({ type: 'DOCUMENT_CAPTURED', document })).toBeNull();
+  });
+
+  it('refuses a document with no content', () => {
+    const document = {
+      url: 'https://example.com/a',
+      title: '',
+      language: null,
+      source: 'web',
+      wordCount: 1,
+      occurredAt: '2026-09-16T09:14:02.000Z',
+    };
+
+    expect(parseRuntimeMessage({ type: 'DOCUMENT_CAPTURED', document })).toBeNull();
+  });
 });
 
 describe('parseContentScriptCommandValue', () => {

@@ -40,6 +40,7 @@ export type {
   AppSessionEvent,
   BookmarkEvent,
   CopyEvent,
+  DocumentUpload,
   DownloadEvent,
   IngestionOutcome,
   IngestionStatus,
