@@ -2,7 +2,7 @@ import { createLlmProvider } from '@second-brain/providers';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
-import { searchDocuments, toSearchQuery, type SearchHit } from '@/lib/queries';
+import { searchDocumentsHybrid, toSearchQuery, type SearchHit } from '@/lib/queries';
 import { createServerSupabaseClient } from '@/lib/supabase-server';
 
 import type { Citation } from '@second-brain/shared';
@@ -17,8 +17,14 @@ const RETRIEVAL_LIMIT = 5;
 const DOCUMENT_CHAR_BUDGET = 3000;
 
 /**
- * Hits below this `ts_rank_cd` score are dropped. A weak text match is worse than no match: it
- * invites the model to answer from loosely related text and cite it.
+ * Hits below this score are dropped. A weak match is worse than no match: it invites the model
+ * to answer from loosely related text and cite it.
+ *
+ * The value is read on two different scales, deliberately. On the full-text leg it is compared
+ * against the RPC's own `ts_rank_cd`, which normalization 32 maps onto `[0, 1)` — a genuine
+ * weak-match floor. The hybrid RPC compares the same argument against its *fused* RRF score,
+ * where each candidate list is only `3 * RETRIEVAL_LIMIT` deep and therefore cannot score below
+ * `1/75`; there the argument is inert and the candidate depth is what bounds the result set.
  */
 const MIN_RANK = 0.01;
 
@@ -116,9 +122,10 @@ function toCitations(hits: SearchHit[]): Citation[] {
 /**
  * `POST /api/chat` — retrieve, then answer with citations.
  *
- * The retrieval leg is the same full-text search the search page uses, narrowed to the five best
- * matches. The answer leg is DeepSeek through the `LlmProvider` interface, so the credential lives
- * only in this process and the browser never sees it.
+ * The retrieval leg is hybrid (vector + full-text, fused by reciprocal rank fusion) narrowed to
+ * the five best matches; it falls back to full-text alone when the embedding provider is
+ * unavailable. The answer leg is DeepSeek through the `LlmProvider` interface, so the credential
+ * lives only in this process and the browser never sees it.
  */
 export async function POST(request: Request): Promise<NextResponse> {
   const supabase = createServerSupabaseClient();
@@ -151,12 +158,18 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   let hits: SearchHit[];
   try {
-    // `toSearchQuery` rather than `question`: the RPC's tsquery treats unquoted words as AND, and a
-    // sentence interrogative enough to pass every content word through also demands every stopword
-    // be present in the document. The answer itself is still built from the untouched question.
-    hits = await searchDocuments(supabase, user.id, toSearchQuery(question), {
+    // Hybrid retrieval: the natural-language question is embedded as a `query`, while the RPC's
+    // text leg gets `toSearchQuery(question)` rather than the question itself, because
+    // `websearch_to_tsquery` reads unquoted words as AND and a sentence interrogative enough to
+    // pass every content word through would also demand every stopword be present in the
+    // document. The answer itself is still built from the untouched question.
+    //
+    // A provider outage degrades to full-text-only inside `searchDocumentsHybrid` instead of
+    // failing here, so this catch now only sees a genuine retrieval error.
+    hits = await searchDocumentsHybrid(supabase, user.id, question, {
       limit: RETRIEVAL_LIMIT,
       minRank: MIN_RANK,
+      ftsQuery: toSearchQuery(question),
     });
   } catch (error) {
     console.error('POST /api/chat retrieval failed', error);

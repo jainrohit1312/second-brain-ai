@@ -643,6 +643,25 @@ export type Database = {
           word_count: number
         }[]
       }
+      search_documents_hybrid: {
+        Args: {
+          match_count: number
+          min_rank?: number
+          query_embedding: string
+          query_text: string
+          user_id: string
+        }
+        Returns: {
+          captured_at: string
+          excerpt: string
+          extraction_status: string
+          id: string
+          rank: number
+          title: string
+          url: string
+          word_count: number
+        }[]
+      }
       upsert_document_captures: {
         Args: { p_device_id: string; p_documents: Json; p_user_id: string }
         Returns: number

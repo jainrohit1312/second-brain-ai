@@ -5,6 +5,11 @@
  * (`DocumentChunk.strategy`), because changing chunking strategy is a re-chunk migration and
  * the stored value is how a future re-processing pass knows which chunks are stale.
  */
+import { assertNever } from '@second-brain/shared';
+
+import { FixedChunker, RecursiveChunker } from './recursive';
+import { SemanticChunker } from './semantic';
+
 import type { Chunker } from '../types';
 import type { EmbeddingProvider } from '@second-brain/providers';
 import type { ChunkingStrategy } from '@second-brain/shared';
@@ -20,18 +25,42 @@ import type { ChunkingStrategy } from '@second-brain/shared';
  *   absent, rather than silently degrading to the recursive chunker — a silent downgrade
  *   would be recorded as `strategy: 'semantic'` on rows that were never semantic.
  *
+ * `SemanticChunker.chunk` is still unimplemented (phase 7); constructing one succeeds so the
+ * failure is a named "not implemented" at the call site rather than a strategy mismatch here.
+ *
  * @param strategy - Strategy recorded on the produced chunks.
  * @param embeddings - Required for `'semantic'`; ignored by the other strategies.
  */
 export function createChunker(
-  _strategy: ChunkingStrategy,
-  _embeddings?: EmbeddingProvider,
+  strategy: ChunkingStrategy,
+  embeddings?: EmbeddingProvider,
 ): Chunker {
-  // TODO(phase-2): exhaustive switch over `ChunkingStrategy` with `assertNever` in the
-  // default branch, so adding a strategy is a compile error here.
-  throw new Error('Not implemented: createChunker');
+  switch (strategy) {
+    case 'recursive':
+      return new RecursiveChunker();
+    case 'fixed':
+      return new FixedChunker();
+    case 'semantic':
+      if (embeddings === undefined) {
+        throw new Error(
+          "createChunker('semantic') requires an EmbeddingProvider: semantic chunking cuts on " +
+            'adjacent-sentence similarity, so it cannot run without one, and falling back to ' +
+            "the recursive chunker would record rows as 'semantic' that never were.",
+        );
+      }
+      return new SemanticChunker(embeddings);
+    default:
+      return assertNever(strategy, `Unknown chunking strategy: ${String(strategy)}`);
+  }
 }
 
-export { CHUNK_OVERLAP, CHUNK_SIZE, DEFAULT_SEPARATORS, RecursiveChunker } from './recursive';
+export {
+  CHUNK_OVERLAP,
+  CHUNK_SIZE,
+  DEFAULT_SEPARATORS,
+  FixedChunker,
+  MIN_CHUNK_SIZE,
+  RecursiveChunker,
+} from './recursive';
 export { SEMANTIC_SIMILARITY_THRESHOLD, SemanticChunker } from './semantic';
 export type { Chunker, ChunkingOptions, TextChunk } from '../types';

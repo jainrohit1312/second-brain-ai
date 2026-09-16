@@ -1,3 +1,4 @@
+import { createEmbeddingProvider } from '@second-brain/providers';
 import { normalizeWhitespace, type ActivityEventType } from '@second-brain/shared';
 
 import type { ActivityEventRow, DocumentRow } from '@second-brain/database';
@@ -291,7 +292,146 @@ export async function searchDocuments(
     throw new Error(`Document search failed: ${error.message}`);
   }
 
-  return ((data ?? []) as SearchRow[]).map((row) => {
+  return mapSearchRows((data ?? []) as SearchRow[]);
+}
+
+/** Options for {@link searchDocumentsHybrid}. */
+export interface HybridSearchOptions extends SearchOptions {
+  /**
+   * The string handed to the full-text leg, when it should differ from the string embedded.
+   *
+   * The two legs want different inputs and this is the only place that difference can be
+   * expressed. The chat route embeds the natural-language question but must send
+   * {@link toSearchQuery}(question) to the RPC, because `websearch_to_tsquery` reads unquoted
+   * words as AND and a question would then demand every stopword be present in the document.
+   * The search box is keyword entry by contract, so it leaves this unset and both legs see the
+   * typist's own words.
+   */
+  ftsQuery?: string;
+}
+
+/**
+ * Env var holding the NVIDIA credential. Read server-side only, inside the function, and
+ * **never** given a `NEXT_PUBLIC_` prefix: that prefix is inlined into the browser bundle.
+ */
+const NVIDIA_API_KEY_ENV = 'NVIDIA_API_KEY';
+
+/**
+ * Interactive budget for the query embedding. The provider defaults (30s per attempt, 3
+ * retries) are sized for a background worker; a search box that waits two minutes looks hung.
+ */
+const QUERY_EMBEDDING_TIMEOUT_MS = 20_000;
+const QUERY_EMBEDDING_MAX_RETRIES = 1;
+
+/** Set once, so a missing key warns rather than filling the log on every request. */
+let warnedAboutMissingEmbeddingKey = false;
+
+/**
+ * Embeds one search query with `inputType: 'query'`.
+ *
+ * Returns `null` — rather than throwing — when the credential is absent, which is a
+ * configuration state and means "run the text leg alone", exactly as phase 1c-1 did.
+ *
+ * The asymmetry is not cosmetic. `nv-embedqa-e5-v5` is trained with different projections for
+ * stored passages and for the query that searches them, and `'query'` is what selects the
+ * query projection. Omitting it — or embedding the query as a `'document'` — does not fail; it
+ * silently returns worse neighbours, which is the worst kind of bug here.
+ */
+async function embedQuery(text: string): Promise<number[] | null> {
+  const apiKey = process.env[NVIDIA_API_KEY_ENV]?.trim();
+
+  if (apiKey === undefined || apiKey === '') {
+    if (!warnedAboutMissingEmbeddingKey) {
+      warnedAboutMissingEmbeddingKey = true;
+      console.warn(
+        `${NVIDIA_API_KEY_ENV} is not set; hybrid retrieval is running the full-text leg alone. ` +
+          'Set it in the server environment to enable vector search.',
+      );
+    }
+    return null;
+  }
+
+  const provider = createEmbeddingProvider('nvidia', {
+    apiKey,
+    timeoutMs: QUERY_EMBEDDING_TIMEOUT_MS,
+    maxRetries: QUERY_EMBEDDING_MAX_RETRIES,
+  });
+
+  const vector = await provider.embedOne(text, { inputType: 'query' });
+  if (vector.length !== provider.dimensions) {
+    throw new Error(
+      `Embedding provider returned a ${vector.length}-dimensional query vector, but ` +
+        `${provider.model} is configured for ${provider.dimensions}.`,
+    );
+  }
+  return vector;
+}
+
+/**
+ * Hybrid retrieval: the vector leg over `document_chunks` fused with the full-text leg over
+ * `documents.fts` by reciprocal rank fusion, via the `search_documents_hybrid` RPC. Same
+ * return shape as {@link searchDocuments}, so a caller can swap one for the other.
+ *
+ * **This function never throws because the embedding provider is unavailable.** A provider
+ * outage degrades to full-text search and is logged; it does not 500 the request. That is the
+ * documented behaviour of the retrieval engine (services/retrieval, S6) and the reason the
+ * fallback goes through {@link searchDocuments} rather than returning an error.
+ *
+ * Losing the vector leg loses exactly what the vector leg is for — paraphrase and
+ * cross-language queries — so the failure is logged at `error` and the caller's answer is
+ * built from a keyword-only result set. An RPC failure degrades the same way, for the same
+ * reason: a database that has not had this migration applied should still answer searches.
+ */
+export async function searchDocumentsHybrid(
+  client: SupabaseClient,
+  userId: string,
+  query: string,
+  options: HybridSearchOptions = {},
+): Promise<SearchHit[]> {
+  const { limit = 20, minRank = 0, ftsQuery = query } = options;
+
+  let embedding: number[] | null = null;
+  try {
+    embedding = await embedQuery(query);
+  } catch (error) {
+    console.error('Query embedding failed; falling back to full-text retrieval only.', error);
+  }
+
+  if (embedding === null) {
+    return searchDocuments(client, userId, ftsQuery, { limit, minRank });
+  }
+
+  try {
+    const { data, error } = await client.rpc('search_documents_hybrid', {
+      user_id: userId,
+      query_text: ftsQuery,
+      // PostgREST sends the argument as text and lets the database cast it to `vector`; the
+      // literal form is what pgvector's input function accepts.
+      query_embedding: JSON.stringify(embedding),
+      match_count: limit,
+      min_rank: minRank,
+    });
+
+    if (error) {
+      throw new Error(`Hybrid search RPC failed: ${error.message}`);
+    }
+
+    return mapSearchRows((data ?? []) as SearchRow[]);
+  } catch (error) {
+    console.error('Hybrid search failed; falling back to full-text retrieval only.', error);
+    return searchDocuments(client, userId, ftsQuery, { limit, minRank });
+  }
+}
+
+/**
+ * Projects the shared row shape of `search_documents` and `search_documents_hybrid`.
+ *
+ * Both RPCs return the same columns on purpose — see the header of
+ * `20260916100600_hybrid_search_rpc.sql` — so the mapping lives here once rather than in two
+ * functions that could drift.
+ */
+function mapSearchRows(rows: readonly SearchRow[]): SearchHit[] {
+  return rows.map((row) => {
     const text = normalizeWhitespace(row.excerpt ?? '');
 
     return {

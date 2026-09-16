@@ -85,6 +85,12 @@ export interface ChunkingOptions {
   chunkSize?: number;
   /** Characters of overlap between consecutive chunks. Defaults to `CHUNK_OVERLAP` (120). */
   overlap?: number;
+  /**
+   * Floor below which a *trailing* chunk is not kept as a chunk of its own. Defaults to
+   * `MIN_CHUNK_SIZE` (400 characters, ~100 tokens). Applied by folding the short tail into
+   * its predecessor rather than discarding it — see `RecursiveChunker.chunk`.
+   */
+  minChunkSize?: number;
   /** Separators tried in order, coarsest first. Chunker-specific default. */
   separators?: readonly string[];
 }

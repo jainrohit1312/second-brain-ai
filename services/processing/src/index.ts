@@ -77,7 +77,13 @@ export {
   stripBoilerplate,
 } from './extraction/cleaner';
 
-export { CHUNK_OVERLAP, CHUNK_SIZE, RecursiveChunker } from './chunking/recursive';
+export {
+  CHUNK_OVERLAP,
+  CHUNK_SIZE,
+  FixedChunker,
+  MIN_CHUNK_SIZE,
+  RecursiveChunker,
+} from './chunking/recursive';
 export { SEMANTIC_SIMILARITY_THRESHOLD, SemanticChunker } from './chunking/semantic';
 export { DEFAULT_SEPARATORS, createChunker } from './chunking/index';
 

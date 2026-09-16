@@ -8,10 +8,10 @@
 //
 // deno.json is JSONC, so these comments are legal and Deno will not strip them.
 //
-// `noUnusedLocals` / `noUnusedParameters` are deliberately not enabled here: while
-// the function body is still a phase-2 TODO, the service-role and user-scoped
-// clients are constructed to keep the wiring visible but are not yet read, and
-// turning those flags on would make `deno check` fail on a correct scaffold.
+// `noUnusedLocals` / `noUnusedParameters` are deliberately not enabled here: they
+// are not part of the rest of the repository's TypeScript configuration, and
+// enabling them would make `deno check` stricter than every other workspace — a
+// failure at deploy time for something no other package is held to.
 {
   "imports": {
     // ESM CDN build pinned to an exact version. Edge function sources are bundled

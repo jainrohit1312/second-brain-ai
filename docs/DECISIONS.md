@@ -37,6 +37,7 @@ Status: draft — scaffold phase, no implementation yet. ADRs marked **Proposed*
 | [ADR-021](#adr-021-phase-1-pins-1024-dimension-embeddings-with-a-named-default-model)                     | Phase 1 pins 1024-dimension embeddings with a named default model                         | Accepted |
 | [ADR-022](#adr-022-ingestion-runs-as-the-process-activity-edge-function)                                  | Ingestion runs as the `process-activity` edge function, written by the service role       | Accepted |
 | [ADR-023](#adr-023-document-upserts-via-service_role-rpc-not-rls-client)                                  | Document upserts via `service_role` RPC, not an RLS client                                | Accepted |
+| [ADR-024](#adr-024-switch-to-the-nemotron-3-embed-model-with-a-matryoshka-reduction-to-1024)              | Switch to the nemotron-3 embed model with a Matryoshka reduction to 1024                  | Accepted |
 
 ---
 
@@ -1421,6 +1422,109 @@ counting both inserts and refreshes.
   `now()` default, making a document's capture time the *sync* time rather than the
   client's — so a queue draining hours late would record the wrong instant, which is the
   failure the event path's clamping exists to avoid.
+
+---
+
+## ADR-024: Switch to the nemotron-3 embed model with a Matryoshka reduction to 1024
+
+**Status:** Accepted
+**Date:** 2026-09-17
+
+### Context
+
+[ADR-021](#adr-021-phase-1-pins-1024-dimension-embeddings-with-a-named-default-model) pinned
+`nvidia/nv-embedqa-e5-v5` as the 1024-wide default and recorded, as the largest cost of that
+decision, that "the pinned model becomes a dependency on one hosted provider's catalogue… a
+deprecation is an ADR-004 re-embed rather than a config change." That risk materialised. As of
+2026-09-17 the model answers
+
+> `410 Gone` — "The model 'nvidia/nv-embedqa-e5-v5' has reached its end of life on
+> 2026-08-25T09:00:00Z and is no longer available."
+
+so no embedding could be produced at all: `document_chunks` stayed empty and every vector leg
+(`match_chunks`, `match_memories`, `hybrid_search`, `search_documents_hybrid`) was inert.
+
+The obvious successor is unavailable too. Measured against this account, six catalogue embedding
+models — `nvidia/llama-nemotron-embed-1b-v2`, `nvidia/embed-qa-4`,
+`nvidia/llama-3.2-nv-embedqa-1b-v1`, `nvidia/nv-embedqa-mistral-7b-v2`,
+`snowflake/arctic-embed-l`, `nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1` — answer
+`404 "Not found for account"`. Two models do serve this account, and **both are 2048-wide
+natively**: `nvidia/nemotron-3-embed-1b` (released 2026-07-16, free endpoint, 34 languages
+including Hindi, 32 768-token context) and `nvidia/llama-nemotron-embed-vl-1b-v2`.
+
+That leaves exactly one question: change the schema width, or reduce the vector.
+
+### Decision
+
+**Pin `nvidia/nemotron-3-embed-1b`, keep `vector(1024)`, and reduce every response client-side**
+— keep the first 1024 values, then L2-normalize — in both embedding paths:
+`packages/providers/src/embedding/nvidia.ts` and the Deno mirror in
+`supabase/functions/embed/index.ts`.
+
+The reduction is a client-side step and **not a request parameter**, which is a correction to the
+shape this change was first specified in:
+
+```
+dimensions: 1024  ->  400 {"message":"dimensions must be one of 2048"}
+dimensions: 512   ->  400 {"message":"dimensions must be one of 2048"}
+```
+
+The endpoint accepts only its native width, so the request asks for 2048 and the adapter reduces.
+
+**The re-normalization is the load-bearing part, and is why this is an ADR rather than a one-line
+model swap.** The native vector is unit-norm (measured 1.000000) and its first-1024 slice is not
+(measured 0.691104), because a slice of a unit vector is not itself a unit vector. Skipping the
+step would leave stored and query vectors consistently mis-scaled — and *inaudible*: cosine
+ordering is invariant under a uniform scale, so nothing would error and nothing would look wrong.
+The damage would surface only as slightly worse recall, which is precisely the class of failure
+[ADR-004](#adr-004-pinned-embedding-dimensions-and-a-mandatory-re-embedding-migration) exists to
+prevent. `reduceToDimensions` therefore slices *and* normalizes, and refuses any width it cannot
+reach that way (a narrower vector is never widened).
+
+The reduction is gated on a declared capability set (`MATRYOSHKA_MODELS`) rather than applied to
+any response that happens to be wider than the column. Slicing a model that was not trained for
+first-k reduction discards information while still producing a numerically valid vector, so a
+model that is not listed is refused instead of quietly reduced. NVIDIA shipping a natively
+1024-wide model would not belong in the set at all.
+
+### Consequences
+
+- **No migration.** The `vector(1024)` columns, both HNSW indexes, and the signatures of
+  `match_chunks`, `match_memories`, `hybrid_search` and `search_documents_hybrid` all stay as
+  they are. ADR-004's re-embed cost is not paid.
+- **ADR-021's pin is replaced, and its width is now derived rather than native.** 1024 is no
+  longer the model's own output width, so ADR-021's "recall ceiling accepted unmeasured" carries
+  one more unmeasured term: the reduction itself. This ADR does not size it.
+- **`EMBEDDING_DIMENSIONS` no longer equals the model's output width**, which narrows how
+  ADR-004's assertion reads. It still holds against the *column*; the provider and the edge
+  function are what bridge the two widths, and both now assert the final length instead.
+- **Two files must agree on the model id and the capability set.** Deno cannot import the pnpm
+  workspace, so this is duplication with a header naming both sides, not a shared constant — the
+  same liability the chunker already carries in that file.
+- **The single-catalogue dependency is unchanged, and this is the second time it has bitten.**
+  A local or second-provider fallback at the same width remains the structural answer; it is out
+  of scope here and belongs in `ROADMAP.md` as a trigger.
+- **It makes the 2048 upgrade cheaper.** If ADR-021's Phase 4 `embedding_v2` swap is taken, the
+  reduction disappears and the model does not change — the migration becomes purely additive.
+
+### Alternatives considered
+
+- **Widen the columns to `vector(2048)`.** The most faithful use of the model, and it costs
+  ADR-004's full re-embed: both embedding columns, both HNSW indexes, and every retrieval-RPC
+  signature. Rejected *for now* because the corpus is 12 documents with zero vectors stored, so
+  the migration would buy an unmeasured quality gain by rewriting the retrieval surface ADR-021
+  deliberately held stable. It remains available, and pre-planned, as the Phase 4 swap.
+- **Send `dimensions: 1024` and let the API truncate.** Not available — the endpoint answers 400.
+  This was the originally specified shape and was measured before implementation.
+- **Slice without re-normalizing.** Rejected. It writes vectors whose scale disagrees with the
+  cosine semantics `<=>` implements, and the resulting recall loss is undiscoverable from any
+  output. This is the most dangerous variant of the change.
+- **Slice any wide response, with no capability set.** Fewer moving parts, and it is what this
+  model's card implies. Rejected because the same code path would silently reduce the next
+  non-Matryoshka model someone configures.
+- **Prefer `nvidia/llama-nemotron-embed-vl-1b-v2`.** Both are 2048-wide and both serve this
+  account. Rejected on fit: it is oriented at vision-language input this pipeline does not
+  produce.
 
 ---
 
