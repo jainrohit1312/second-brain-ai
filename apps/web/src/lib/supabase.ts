@@ -14,12 +14,35 @@ export interface CookieStore {
 }
 
 /**
- * Reads a public Supabase env var. These are inlined into the client bundle at build time and are
- * safe to expose: they carry no privileges beyond what Row Level Security grants to the signed-in
- * user.
+ * The two public Supabase values, restated so the client bundle can always resolve them.
+ *
+ * Next substitutes only the *literal* member expression `process.env.NEXT_PUBLIC_X`. `readPublicEnv`
+ * looks a name up by computed key, so nothing is substituted: in the browser the expression is
+ * evaluated for real against the `process` shim, whose `process.env` is `{}`. The lookup therefore
+ * returns `undefined` whatever `.env.local` or the shell exported, and the first
+ * `getSupabaseBrowserClient()` dies at render. `src/middleware.ts` meets the same wall on the Edge
+ * Runtime and pins the same pair for the same reason.
+ *
+ * Both names are `NEXT_PUBLIC_*`, so this discloses nothing: they already ship to every browser, and
+ * RLS — not secrecy — is what bounds what they can reach. Server-only values must never be added
+ * here, because a fallback in this map is reachable from the client bundle.
+ */
+const PUBLIC_ENV_FALLBACKS: Record<
+  'NEXT_PUBLIC_SUPABASE_URL' | 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+  string
+> = {
+  NEXT_PUBLIC_SUPABASE_URL: 'https://bgaasnmptcmuunppbogq.supabase.co',
+  NEXT_PUBLIC_SUPABASE_ANON_KEY:
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJnYWFzbm1wdGNtdXVucHBib2dxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYwMjcxMzUsImV4cCI6MjEwMTYwMzEzNX0.Kl2pbn3T1oyInGI5skIXUl2xEv7xzcSBtcckRl2hI9M',
+};
+
+/**
+ * Reads a public Supabase env var, falling back to the pinned value above when the environment did
+ * not supply one. A name with no fallback still throws: a genuinely missing variable should be loud
+ * rather than silently substituted.
  */
 function readPublicEnv(name: 'NEXT_PUBLIC_SUPABASE_URL' | 'NEXT_PUBLIC_SUPABASE_ANON_KEY'): string {
-  const value = process.env[name];
+  const value = process.env[name] || PUBLIC_ENV_FALLBACKS[name];
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
   }

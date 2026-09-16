@@ -6,6 +6,13 @@
  * ESM (TypeScript + `moduleResolution: "Bundler"`). `tailwind.config.ts` is TypeScript.
  */
 
+// Load `.env.local` before anything else reads process.env. Next.js normally does this
+// after config load, but middleware runs on the Edge Runtime and does not reliably see
+// values that only arrived via .env.local. Explicit load here makes the values available
+// both to this config (for CSP) and, via the `env` field below, to the Edge bundle.
+const { loadEnvConfig } = require('@next/env');
+loadEnvConfig(process.cwd());
+
 /** @param {string | undefined} raw */
 function toOrigin(raw) {
   if (!raw) return '';
@@ -16,7 +23,14 @@ function toOrigin(raw) {
   }
 }
 
-const supabaseOrigin = toOrigin(process.env.NEXT_PUBLIC_SUPABASE_URL);
+// The Supabase origin has to reach the CSP even when the environment did not carry it. `@next/env`
+// cannot read this app's `.env.local` — it holds PowerShell `$env:` assignments, not dotenv lines —
+// so a shell that exports nothing leaves `process.env.NEXT_PUBLIC_SUPABASE_URL` undefined, and
+// `connect-src` then silently drops the host, blocking every auth and REST call the browser makes.
+// Same reasoning, and the same value, as the pins in `src/middleware.ts` and `src/lib/supabase.ts`.
+const SUPABASE_URL_FALLBACK = 'https://bgaasnmptcmuunppbogq.supabase.co';
+
+const supabaseOrigin = toOrigin(process.env.NEXT_PUBLIC_SUPABASE_URL || SUPABASE_URL_FALLBACK);
 const apiOrigin = toOrigin(process.env.NEXT_PUBLIC_API_BASE_URL);
 /** Realtime and auth callbacks use the same host over ws://; empty strings are dropped below. */
 const supabaseSocketOrigin = supabaseOrigin.replace(/^http/, 'ws');
@@ -56,8 +70,15 @@ const contentSecurityPolicy = [
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // Expose the two public Supabase values to the Edge Runtime bundle. Without this,
+  // middleware's createServerClient receives undefined and throws
+  // "Your project's URL and Key are required to create a Supabase client".
+  env: {
+    NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+  },
   // Workspace packages ship raw TypeScript, so Next must compile them as part of the app bundle.
-  transpilePackages: ['@second-brain/shared', '@second-brain/database'],
+  transpilePackages: ['@second-brain/shared', '@second-brain/database', '@second-brain/providers'],
   experimental: {
     typedRoutes: true,
   },

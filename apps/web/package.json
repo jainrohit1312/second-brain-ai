@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@second-brain/database": "workspace:*",
+    "@second-brain/providers": "workspace:*",
     "@second-brain/shared": "workspace:*",
     "@supabase/ssr": "^0.5.1",
     "@supabase/supabase-js": "^2.45.4",

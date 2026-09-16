@@ -1,4 +1,11 @@
-import { ArrowRight, LayoutDashboard, MessageSquare, Settings, Sparkles } from 'lucide-react';
+import {
+  ArrowRight,
+  LayoutDashboard,
+  MessageSquare,
+  Search,
+  Settings,
+  Sparkles,
+} from 'lucide-react';
 import Link from 'next/link';
 
 import { buttonVariants } from '@/components/ui/Button';
@@ -10,7 +17,7 @@ import { Skeleton } from '@/components/ui/Skeleton';
  * stays assignable to the App Router's typed-route `href`.
  */
 interface EntryPoint {
-  href: '/chat' | '/dashboard' | '/settings';
+  href: '/chat' | '/dashboard' | '/search' | '/settings';
   title: string;
   description: string;
   icon: typeof MessageSquare;
@@ -26,10 +33,17 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   },
   {
     href: '/dashboard',
-    title: 'Activity',
+    title: 'Dashboard',
     description:
-      'See where your attention went: time per topic, the latest captures, and a weighted topic cloud.',
+      'What arrived from your devices, and what came out of it: today’s captures, the week’s documents, and the domains you spent time on.',
     icon: LayoutDashboard,
+  },
+  {
+    href: '/search',
+    title: 'Search',
+    description:
+      'Keyword search over the extracted text of your documents, ranked by relevance rather than by date.',
+    icon: Search,
   },
   {
     href: '/settings',
@@ -49,7 +63,7 @@ export default function HomePage() {
       <section className="flex max-w-2xl flex-col gap-5">
         <span className="inline-flex w-fit items-center gap-2 rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
           <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-          Scaffold — structure and contracts only
+          Phase 1c-1 — real captures, real answers
         </span>
         <h1>A second brain that shows its receipts.</h1>
         <p className="text-base text-muted-foreground">

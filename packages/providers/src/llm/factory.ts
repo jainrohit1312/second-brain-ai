@@ -106,8 +106,9 @@ const LLM_PROVIDER_CONSTRUCTORS: Record<LlmProviderId, (config: ProviderConfig) 
  * Builds a provider from the defaults table plus `overrides`.
  *
  * Reads no environment and validates no credential: pass the key in `overrides`
- * or use `llmProviderFromEnv`. The returned instance is ready to use but every
- * method still throws until phase 2.
+ * or use `llmProviderFromEnv`. The returned instance is ready to use: `complete`
+ * is implemented on the adapters that have a consumer today, while `stream`,
+ * `completeJson` and `health` still throw until phase 2.
  */
 export function createLlmProvider(
   id: LlmProviderId,
