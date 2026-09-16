@@ -1,0 +1,26 @@
+# Prettier must never own generated or tool-owned files. If a file is produced
+# by a build step or a package manager, exclude it here rather than reformat it —
+# otherwise every regeneration shows up as a spurious diff.
+
+# Package manager output
+pnpm-lock.yaml
+
+# Next.js generated
+next-env.d.ts
+.next/
+
+# Build output
+dist/
+build/
+out/
+.turbo/
+coverage/
+
+# Dependencies
+node_modules/
+
+# Android / Gradle build trees (the Kotlin sources are not Prettier's concern;
+# only the README and markdown under apps/android are checked)
+apps/android/app/build/
+apps/android/build/
+apps/android/.gradle/

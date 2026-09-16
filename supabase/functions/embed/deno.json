@@ -1,0 +1,29 @@
+// Deno configuration for the `embed` edge function.
+//
+// Edge functions are NOT part of the pnpm workspace: Deno resolves its own
+// imports (below) and reads none of the repo's tsconfig files, which is also why
+// `supabase/functions` is listed in ESLint's ignorePatterns. The Supabase CLI
+// reads this file as the function's import map for both `functions serve` and
+// `functions deploy`.
+//
+// deno.json is JSONC, so these comments are legal and Deno will not strip them.
+//
+// `noUnusedLocals` / `noUnusedParameters` are deliberately not enabled here: while
+// the function body is still a phase-2 TODO, the service-role and user-scoped
+// clients are constructed to keep the wiring visible but are not yet read, and
+// turning those flags on would make `deno check` fail on a correct scaffold.
+{
+  "imports": {
+    // ESM CDN build pinned to an exact version. Edge function sources are bundled
+    // at deploy time, so a floating specifier would let an unrelated deploy change
+    // behaviour.
+    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.4"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "lib": ["deno.ns", "dom", "dom.iterable", "esnext"]
+  }
+}

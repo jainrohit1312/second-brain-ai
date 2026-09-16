@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup rules for Android 11 and below (android:fullBackupContent).
+
+  The Room capture queue and the encrypted auth session are excluded from cloud backup
+  and from device-to-device transfer: both are per-device state. Restoring the queue on
+  a different install would push another device's rows under this device's id, and
+  restoring an auth token onto a different device is exactly the credential-relocation
+  case the threat model forbids.
+-->
+<full-backup-content>
+    <!-- Capture queue: per-device outbound events (plus its WAL/SHM siblings). -->
+    <exclude domain="database" path="second_brain_queue.db" />
+    <exclude domain="database" path="second_brain_queue.db-wal" />
+    <exclude domain="database" path="second_brain_queue.db-shm" />
+
+    <!-- Encrypted session: access + refresh token. -->
+    <exclude domain="sharedpref" path="second_brain_session.xml" />
+
+    <!-- Preferences DataStore: the per-device exclusion list. -->
+    <exclude domain="file" path="datastore" />
+</full-backup-content>

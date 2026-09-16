@@ -1,0 +1,37 @@
+{
+  "name": "@second-brain/providers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Embedding and LLM provider adapters behind one interface",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "clean": "rimraf dist .turbo"
+  },
+  "dependencies": {
+    "@second-brain/shared": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "rimraf": "^6.0.1",
+    "tsup": "^8.2.1",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}

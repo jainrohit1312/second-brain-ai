@@ -1,0 +1,18 @@
+# Workspace definition for pnpm.
+#
+# NOTE: apps/android is a Gradle project and deliberately excluded from the
+# JavaScript workspace. It consumes the backend over HTTPS, not over npm.
+packages:
+  - "apps/chrome-extension"
+  - "apps/web"
+  - "services/*"
+  - "packages/*"
+
+# Keep a single version of these in the monorepo to avoid duplicate React
+# instances and mismatched Supabase client types across workspaces.
+catalog:
+  react: 18.3.1
+  react-dom: 18.3.1
+  "@supabase/supabase-js": 2.45.4
+  zod: 3.23.8
+  typescript: 5.5.4

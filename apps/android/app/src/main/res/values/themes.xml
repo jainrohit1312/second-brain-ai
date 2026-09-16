@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  App theme referenced from AndroidManifest.xml (android:theme).
+
+  Deliberately minimal: colours, typography and component shapes are owned by Compose
+  (ui/theme/Theme.kt). This XML theme only has to give the window a sane background,
+  no ActionBar and transparent system bars before the first Compose frame renders.
+  Parent chain is the platform Material theme, so no com.google.android.material
+  dependency is needed for a Compose-only app.
+
+  Only API-level-safe attributes are used here (minSdk 26). Edge-to-edge on API 35 is
+  enforced by the platform and enabled in code via enableEdgeToEdge().
+-->
+<resources>
+    <style name="Theme.SecondBrain" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">?android:attr/colorBackground</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

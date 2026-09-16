@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Second Brain</string>
+
+    <!-- Top-level navigation -->
+    <string name="nav_activity">Activity</string>
+    <string name="nav_search">Search</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Placeholder screens (phase-2 replaces the bodies, not the routes) -->
+    <string name="activity_screen_title">Activity</string>
+    <string name="activity_screen_body">Foreground app sessions captured on this device will appear here.</string>
+    <string name="search_screen_title">Search</string>
+    <string name="search_screen_body">Semantic search over your documents and memories lands in phase-2.</string>
+    <string name="settings_screen_title">Settings</string>
+    <string name="settings_screen_body">Capture, privacy and sync controls live here.</string>
+
+    <!-- Ongoing foreground-service notification -->
+    <string name="notification_channel_capture_name">Activity capture</string>
+    <string name="notification_channel_capture_description">Shown while Second Brain records which app is in the foreground.</string>
+    <string name="notification_capture_title">Second Brain is capturing activity</string>
+    <string name="notification_capture_text">Foreground app sessions stay on this device until synced.</string>
+    <string name="usage_watcher_service_description">Records which app is in the foreground so your activity feed stays complete.</string>
+
+    <!-- Usage-access special permission -->
+    <string name="usage_access_rationale_title">Usage access is required</string>
+    <string name="usage_access_rationale_body">Second Brain reads foreground app sessions through the system Usage Access API. Turn on \"Usage access\" for Second Brain in Settings; without it, nothing is captured and this screen stays empty.</string>
+    <string name="usage_access_settings_action">Open usage access settings</string>
+    <string name="usage_access_not_granted">Usage access has not been granted. Open Settings > Apps > Special app access > Usage access, choose Second Brain, then Allow.</string>
+
+    <!-- Settings -->
+    <string name="settings_capture_title">Capture foreground apps</string>
+    <string name="settings_capture_summary">Runs the capture service and keeps the ongoing notification visible.</string>
+    <string name="settings_excluded_apps_title">Excluded apps</string>
+    <string name="settings_excluded_apps_summary">Banking, password managers, health and private-browsing apps are excluded by default.</string>
+    <string name="settings_privacy_note">Excluded apps are never recorded — not even as an anonymous or redacted entry.</string>
+    <string name="settings_sync_title">Sync</string>
+    <string name="settings_sync_summary">Queued sessions upload in the background when a network is available.</string>
+    <string name="settings_sign_out">Sign out</string>
+    <string name="settings_signed_out">Not signed in</string>
+</resources>

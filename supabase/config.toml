@@ -1,0 +1,179 @@
+# ---------------------------------------------------------------------------
+# Second Brain — Supabase CLI configuration.
+#
+# This file drives the local stack (`supabase start`) and is also read by
+# `supabase link` / `supabase db push`. Values that only make sense locally are
+# commented as such, because a linked remote project keeps its own settings.
+#
+# Nothing here is a secret: local secrets live in the repo-root `.env`
+# (see .env.example) and remote secrets are set with `supabase secrets set`.
+# ---------------------------------------------------------------------------
+
+project_id = "second-brain"
+
+[api]
+enabled = true
+# Shifted from Supabase's conventional 54321 to 55321 — a flat +1000 across every
+# port in this file — so this stack can run alongside other local Supabase
+# projects on this machine. `.env.example`, `scripts/*.sh`, `supabase/README.md`,
+# `supabase/seed.sql`, `packages/database/README.md` and `docs/` carry the matching
+# values and MUST move in the same commit. If they drift, a client reading
+# `.env.example` silently points at a different project's local database rather
+# than failing — which is the worst outcome available here.
+port = 55321
+schemas = ["public", "graphql_public", "second_brain"]
+# `public` stays FIRST and stays exposed. Two reasons, both deliberate:
+#   1. Supabase's own helpers (auth/storage/storage extensions) assume it, and
+#      dropping it from this list breaks Studio and parts of the platform.
+#   2. It is the *default* schema for a request that sends no `Accept-Profile`
+#      header. Our clients bind `db: { schema: 'second_brain' }` explicitly
+#      (see packages/database/src/client.ts), so a client that forgets to is
+#      rewarded with a loud "relation does not exist" instead of silently
+#      reading the wrong schema — `second_brain` holds every application table
+#      and `public` holds none of ours.
+# Effect of this line: PostgREST does not serve a schema it is not told about,
+# so without `second_brain` here every query against it fails with PGRST106
+# regardless of how correct the RLS policies are.
+# `extra_search_path` sits on the search path so `vector` operators and functions
+# resolve unqualified in queries and migrations. See the [db] note below.
+extra_search_path = ["public", "extensions", "second_brain"]
+# Ceiling for a single PostgREST response. Callers paginate beyond this; it is
+# also a guard against a client accidentally pulling an entire history table.
+max_rows = 1000
+
+[db]
+port = 55322
+shadow_port = 55320
+# Pinned to 15 so the local Postgres matches the version the hosted project runs.
+major_version = 15
+# pgvector is enabled by a MIGRATION, not here — this file has no extension list,
+# and nothing written here would reach the hosted database anyway. Concretely:
+#   - the local Supabase image already ships the `vector` extension, so a single
+#     `create extension if not exists vector;` in the first migration is enough;
+#   - the remote database needs that exact same line, because the hosted image
+#     ships it too but a fresh project does not have it enabled per-database.
+# Keeping it in a migration is what makes `supabase db reset` local and
+# `supabase db push` remote end up in the same state. See supabase/README.md.
+
+[db.seed]
+# `supabase db reset` replays migrations and then runs the files listed below.
+# Declared explicitly rather than relying on the CLI's default so the behaviour of
+# a reset is visible in this file.
+#
+# DISABLED BY DEFAULT, deliberately, and this is a decision that needs revisiting.
+# `seed.sql` references a fixed `auth.users` id (00000000-0000-0000-0000-000000000001),
+# and `devices.user_id` is a foreign key to `auth.users`. On a fresh machine that
+# user does not exist, so the seed fails:
+#
+#   ERROR: insert or update on table "devices" violates foreign key constraint
+#          "devices_user_id_fkey" (SQLSTATE 23503)
+#
+# Because `supabase start` seeds as well as `supabase db reset`, a failing seed
+# means the stack never comes up at all. With `enabled = false` a reset produces a
+# correct schema-only database, and the seed can be run deliberately once a local
+# user exists:
+#
+#   supabase auth admin create-user --email dev@example.com --password devpass123
+#   # then substitute the generated id for the placeholder in seed.sql and either
+#   # re-enable this block or apply the file by hand from Studio
+#
+# The alternatives — having `seed.sql` create the GoTrue user itself (needs an
+# `auth.identities` row and a bcrypt password, and the row shape varies by Supabase
+# version), or guarding every seed insert so it no-ops without a user — are tracked
+# in docs/TASKS.md phase 1.
+enabled = false
+sql_paths = ["./seed.sql"]
+
+[realtime]
+# Enabled for the web dashboard's live activity feed. Nothing else subscribes.
+enabled = true
+
+[studio]
+enabled = true
+# Studio URL — scripts/setup.sh prints exactly this address.
+port = 55323
+
+[local_smtp]
+# Local SMTP sink that captures all outbound auth mail (confirmations, magic
+# links) so nothing leaves the machine during development.
+# The section is `[local_smtp]`, not `[inbucket]`: the CLI deprecated the old
+# name and prints a warning on every command while it is present.
+enabled = true
+port = 55324
+
+[storage]
+enabled = true
+# Per-object ceiling for raw captured documents (PDFs, saved articles).
+file_size_limit = "50MiB"
+
+[auth]
+enabled = true
+# Where the hosted goTrue instance sends users back after sign-in.
+site_url = "http://127.0.0.1:3000"
+# apps/web dev server. Deployed origins get added here when they exist.
+additional_redirect_urls = ["http://127.0.0.1:3000", "http://localhost:3000"]
+# One hour, matching the hosted default; clients refresh silently through
+# supabase-js, so this is a blast-radius choice rather than a UX one.
+jwt_expiry = 3600
+enable_signup = true
+# LOCAL ONLY. `false` skips the confirmation-mail round-trip so a developer can
+# sign in immediately after `supabase auth admin create-user`. Must be `true`
+# in staging and prod — a hosted project's own Auth settings win over this file.
+enable_confirmations = false
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = false
+# Newer CLI versions read the confirmation toggle from this block instead of
+# [auth]. Both are set so local behaviour is identical on old and new CLIs;
+# delete the [auth] copy once the whole team is on a recent CLI.
+enable_confirmations = false
+
+[edge_runtime]
+enabled = true
+# `per_worker` keeps one isolate alive per worker instead of tearing the runtime
+# down as soon as a request returns. The default policy would kill long-running
+# distillation work mid-flight; see [functions.distill] below.
+policy = "per_worker"
+# Chrome DevTools attaches here: `chrome://inspect` → localhost:8083. Use it to
+# step through an edge function rather than guessing from logs.
+inspector_port = 8083
+
+[analytics]
+# The Logflare container is not used anywhere in this repo. Disabling it keeps
+# `supabase start` fast and the local machine quiet.
+enabled = false
+
+# ---------------------------------------------------------------------------
+# Edge functions
+#
+# All three functions keep `verify_jwt = true`. Every caller is either a signed-in
+# user (whose identity must reach RLS) or a server process holding a service-role
+# key, so there is no deployment reason to expose an unauthenticated endpoint.
+# None of these functions may ever be deployed with `--no-verify-jwt`; when one
+# needs more time, the answer is a background invocation, not an open endpoint.
+#
+# Each function directory carries its own `deno.json`, which the CLI reads as the
+# function's import map. Those directories are outside the pnpm workspace (Deno
+# resolves its own imports) and are ignored by ESLint for the same reason.
+# ---------------------------------------------------------------------------
+
+[functions.process-activity]
+# Called by the ingestion service and by device sync. The caller's JWT identifies
+# the user whose rows are being written, so verification is what scopes the write.
+verify_jwt = true
+
+[functions.embed]
+verify_jwt = true
+# This function needs a longer wall-clock budget than a page view: it embeds a
+# batch of chunks against a remote provider. The fix for that is NOT
+# `--no-verify-jwt` and NOT a public endpoint — keep JWT verification on and call
+# it as a background/queued job so a slow provider cannot hold a client request
+# open past the platform timeout, and size each batch to fit inside the limit.
+
+[functions.distill]
+verify_jwt = true
+# Longest-running function in the system (chunk extraction → dedup →
+# merge/supersede decisions → memory writes) and always invoked in the
+# background. A client request must never wait on it, and it must stay
+# idempotent because a retried invocation is expected, not exceptional.

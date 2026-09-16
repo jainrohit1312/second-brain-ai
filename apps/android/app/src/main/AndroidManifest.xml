@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Network: sync POSTs queued batches to services/ingestion over HTTPS, and
+         ACCESS_NETWORK_STATE is used by SyncWorker's pre-flight check before it opens a
+         connection. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- The capture service runs as a foreground service of type dataSync, so it needs
+         both FOREGROUND_SERVICE and the data-sync specific permission (API 34+). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- The ongoing capture notification is posted by the foreground service; on
+         API 33+ the user must also grant this at runtime before it is visible. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- WorkManager's own boot receiver reschedules pending sync work after a reboot.
+         Declared explicitly so the requirement is visible here rather than only in the
+         merged manifest. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- SPECIAL ACCESS, NOT A RUNTIME PERMISSION.
+         PACKAGE_USAGE_STATS can only be granted by the user in
+         Settings > Apps > Special app access > Usage access. Declaring it here does
+         nothing on its own; UsageStatsWatcher silently sees no events until the user
+         grants it. `tools:ignore` silences the ProtectedPermissions lint that fires on
+         any permission in the android.permission group normally held by the system. -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- QUERY_ALL_PACKAGES lets the privacy screen resolve a human-readable label for
+         any package the usage-stats API reports. That lookup is unavoidable because
+         the exclusion list is user-editable: a static <queries> allowlist could never
+         enumerate the set of apps a user may choose to exclude, and usage-stats can
+         report packages with no MAIN/LAUNCHER activity.
+         Play Store note: this permission requires a declaration form at submission
+         time, and the app degrades gracefully without it (labels fall back to the raw
+         package name; exclusion itself keeps working, since exclusion is keyed on the
+         package name, not on the label). -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <application
+        android:name=".SecondBrainApp"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.SecondBrain"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.SecondBrain"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Foreground capture service. Not exported: nothing outside the app may start
+             or bind it. `foregroundServiceType="dataSync"` matches the permission above
+             and the FIFTH startForeground argument in UsageStatsWatcher. -->
+        <service
+            android:name=".watcher.UsageStatsWatcher"
+            android:description="@string/usage_watcher_service_description"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+
+</manifest>

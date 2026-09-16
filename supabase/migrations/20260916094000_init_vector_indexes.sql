@@ -1,0 +1,151 @@
+-- ---------------------------------------------------------------------------
+-- 20260916094000_init_vector_indexes.sql
+--
+-- Creates the two HNSW indexes on the two vector search surfaces:
+-- `document_chunks.embedding` and `memories.embedding`.
+--
+-- Depends on: 20260916085500_init_schema.sql      (the schema and its grants)
+--             20260916090000_init_extensions.sql  (`create extension vector`,
+--                                                  which also supplies the `hnsw`
+--                                                  access method and the vector
+--                                                  operator classes; this file
+--                                                  fails with `access method
+--                                                  "hnsw" does not exist` if it
+--                                                  runs first)
+--             20260916091000_init_core_tables.sql (the eight tables, including
+--                                                  the `vector(1024)` columns)
+-- Follows:    20260916093000_init_indexes.sql     (the non-vector indexes — no
+--                                                  dependency, only history order)
+-- Specified by: docs/DATABASE_SCHEMA.md#document_chunks,
+--               docs/DATABASE_SCHEMA.md#memories,
+--               docs/DATABASE_SCHEMA.md#vector-dimensions-and-the-cost-of-changing-them,
+--               docs/DATABASE_SCHEMA.md#the-two-search-surfaces,
+--               ADR-016 and ADR-008 in docs/DECISIONS.md.
+--
+-- HNSW, NOT IVFFLAT. ADR-016 is Accepted: every vector index in this schema is
+-- `using hnsw`. The reasons are that the tables are empty when this runs (IVFFlat
+-- trains its list centroids from existing rows, so an index built on an empty
+-- table is useless and the `lists` parameter would have to be guessed from a row
+-- count that does not exist yet), and that ingestion is continuous and
+-- incremental (IVFFlat's recall degrades as rows drift from the centroids until a
+-- rebuild, which would add a rebuild job this system otherwise does not need).
+-- No `ivfflat` index exists in this file, and none may be added without
+-- superseding ADR-016.
+--
+-- REQUIRES pgvector >= 0.5. HNSW was introduced in pgvector 0.5.0; on an older
+-- extension the statement fails with `access method "hnsw" does not exist`, which
+-- reads like a missing extension rather than an old one. The same floor is stated
+-- in the worked example in docs/DATABASE_SCHEMA.md.
+--
+-- OPCLASS: vector_cosine_ops, BECAUSE RETRIEVAL USES COSINE DISTANCE.
+--   The embeddings are L2-normalised, cosine distance (`<=>`) is the correct
+--   metric for them, and the retrieval queries order by `embedding <=> $1`
+--   ascending. The opclass is not a performance hint — it selects which distance
+--   function the graph was built around. An index built with `vector_l2_ops` and
+--   queried with `<=>` does not error: Postgres still finds *neighbours*, but they
+--   are the neighbours under a different metric, so the wrong rows come back with
+--   plausible distances and nothing in the logs. A mismatch is therefore a
+--   silent-correctness bug, not a misconfiguration, and is the reason the opclass
+--   is written out on every index here rather than left to a default.
+--
+-- Build parameters are left at the pgvector defaults — `m = 16`,
+-- `ef_construction = 64` — and `hnsw.ef_search` is left at its default (40).
+-- ADR-016 says explicitly that these are the knobs to reach for if recall or
+-- latency disappoints, and that they must not be guessed at now. If recall is
+-- poor, the first hypothesis is the embedding model and the second is
+-- `ef_search`; that ordering is deliberate, so the wrong knob is not turned first.
+--
+-- WHY THESE TWO INDEXES ARE IN A MIGRATION OF THEIR OWN
+--   An HNSW build is slow and gets slower with table size, and it takes an ACCESS
+--   EXCLUSIVE lock on the table while it runs. Here that is free, because both
+--   tables are empty — which is the property ADR-016 relies on for a linear,
+--   replayable migration history. But it is also the operation that a future
+--   re-embed migration must reason about: ADR-004's procedure populates the new
+--   column, then builds its HNSW index, then drops the old column and index, and
+--   that build runs on a populated table. Keeping the vector indexes in their own
+--   file is what makes "build the index" a reviewable step rather than a line
+--   buried among a table's B-tree indexes.
+--
+-- WHAT IS DELIBERATELY ABSENT
+--   No tables, columns, constraints, policies, triggers, grants, or seed data.
+--   No index on `topics.centroid`. It is a `vector(1024)` column and it gets no
+--   vector index: it is read in full (there are tens of topics, not thousands)
+--   and nearest-centroid assignment is a sequential scan over a tiny table.
+--   ADR-016 states this, and docs/DATABASE_SCHEMA.md#topics repeats it — the
+--   absence is a decision, not an omission.
+--   No partial index on `user_id`. See the note under the chunk index below; it
+--   is the mistake a future reader is most likely to make in good faith.
+--
+-- NO `begin;` / `commit;`. The Supabase CLI wraps each migration file in a
+-- transaction already.
+--
+-- IDEMPOTENT. Both statements are `create index if not exists`.
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- document_chunks — the primary retrieval surface
+-- ---------------------------------------------------------------------------
+
+-- The vector search surface, at chunk granularity: cosine-distance nearest
+-- neighbours over the chunk embeddings, fused with the GIN leg by reciprocal rank
+-- fusion (ADR-006).
+--
+-- The index is NOT partial on `user_id`, and this is deliberate rather than an
+-- oversight. A per-user partial index would need one index per user, and no
+-- migration can create the index for a user who does not exist yet — so a new
+-- user's first search would run unindexed, and the "optimisation" would only be
+-- correct for the users who already had a row when it was written. Per-user
+-- scoping is applied as a predicate in the query (`user_id = auth.uid()`, backed
+-- by RLS) and Postgres combines it with the HNSW scan. This is a known tradeoff
+-- of the shared-table design (ADR-003): the index is global, the filter is a
+-- predicate, and the recall/latency effect of filtering after an ANN scan is one
+-- of the things to measure in phase 4.
+--
+-- The column is `vector(1024)` and the index does not restate the width: an HNSW
+-- index takes the operator class, not the dimension, and the dimension comes from
+-- the column definition. There is no width to write here and inventing one would
+-- contradict ADR-004's pinned dimension.
+--
+-- `set search_path` is REQUIRED here, and it is the single deliberate exception to
+-- this repository's "qualify every object" rule. `CREATE INDEX … USING <method>`
+-- accepts only an UNQUALIFIED access-method name — `using extensions.hnsw` is a
+-- syntax error, verified against Postgres 15 — and the operator class in the same
+-- parenthesised list is resolved by name too. So `hnsw` and `vector_cosine_ops`
+-- have to be findable by name, and a search_path assignment is the only mechanism
+-- that can do that. The target table stays fully qualified, so no index can land
+-- in the wrong schema; only the access method and operator class are looked up.
+set search_path = extensions, public;
+
+create index if not exists document_chunks_embedding_hnsw_idx
+  on second_brain.document_chunks using hnsw (embedding vector_cosine_ops);
+
+-- ---------------------------------------------------------------------------
+-- memories — the statement retrieval surface
+-- ---------------------------------------------------------------------------
+
+-- The vector surface for memories, PARTIAL ON `status = 'active'`, and the
+-- partiality is load-bearing rather than an optimisation.
+--
+-- ADR-008 is the rule that a memory is superseded, never deleted, so `memories`
+-- retains superseded, archived, and rejected rows indefinitely — and
+-- `memories_select_own` deliberately lets the user see all of them, because it is
+-- their own history. That means an unpredicated vector query on this table
+-- returns *superseded beliefs as if they were current*, with no error and no
+-- empty result to notice: the query runs, the neighbours are plausible, and the
+-- answer is built on a statement the system has stopped believing.
+--
+-- Making the index partial on `status = 'active'` inverts that failure. An
+-- unfiltered query no longer has an index to lean on: it still returns the same
+-- wrong rows (Postgres will not refuse to run it, and a partial index is not a
+-- constraint), but the *fast* path is now the correct path, so the correct query
+-- is also the cheap one and the incorrect one is visibly expensive against a
+-- corpus of any size. This is the mechanism docs/DATABASE_SCHEMA.md#memories
+-- calls out by name, and `memories_fts_gin_idx` in the previous migration is
+-- partial for exactly the same reason and with exactly the same predicate.
+--
+-- The same reasoning does NOT apply to `document_chunks`, whose index above is
+-- not partial: chunks have no lifecycle status, and a soft-deleted document is
+-- filtered by `deleted_at is null` in the query rather than by the index.
+create index if not exists memories_embedding_hnsw_idx
+  on second_brain.memories using hnsw (embedding vector_cosine_ops)
+  where status = 'active';

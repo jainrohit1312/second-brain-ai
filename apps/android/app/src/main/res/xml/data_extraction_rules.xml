@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup and transfer rules for Android 12+ (android:dataExtractionRules).
+  Supersedes res/xml/backup_rules.xml on API 31+, which is kept for older devices.
+
+  The Room capture queue and the encrypted auth session are excluded from BOTH
+  cloud-backup and device-transfer: the queue is per-device outbound state whose rows
+  belong to the device id that created them, and the refresh token must never be
+  restored onto a different device.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="database" path="second_brain_queue.db" />
+        <exclude domain="database" path="second_brain_queue.db-wal" />
+        <exclude domain="database" path="second_brain_queue.db-shm" />
+
+        <exclude domain="sharedpref" path="second_brain_session.xml" />
+
+        <exclude domain="file" path="datastore" />
+    </cloud-backup>
+
+    <device-transfer>
+        <exclude domain="database" path="second_brain_queue.db" />
+        <exclude domain="database" path="second_brain_queue.db-wal" />
+        <exclude domain="database" path="second_brain_queue.db-shm" />
+
+        <exclude domain="sharedpref" path="second_brain_session.xml" />
+
+        <exclude domain="file" path="datastore" />
+    </device-transfer>
+</data-extraction-rules>

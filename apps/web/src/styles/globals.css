@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Semantic colour tokens consumed by tailwind.config.ts.
+ * Values are bare HSL triplets (no `hsl()` wrapper) so Tailwind can apply opacity modifiers.
+ */
+@layer base {
+  :root {
+    --background: 210 25% 98%;
+    --foreground: 222 25% 12%;
+
+    --muted: 210 20% 94%;
+    --muted-foreground: 215 16% 42%;
+
+    --border: 214 20% 88%;
+
+    --primary: 221 68% 45%;
+    --primary-foreground: 210 40% 98%;
+
+    --accent: 199 65% 92%;
+    --accent-foreground: 221 55% 24%;
+
+    --destructive: 0 68% 48%;
+    --destructive-foreground: 0 0% 100%;
+
+    --ring: 221 68% 45%;
+
+    --radius: 0.625rem;
+  }
+
+  .dark {
+    --background: 222 24% 9%;
+    --foreground: 210 22% 94%;
+
+    --muted: 220 18% 16%;
+    --muted-foreground: 215 16% 65%;
+
+    --border: 220 16% 22%;
+
+    --primary: 221 76% 66%;
+    --primary-foreground: 222 40% 10%;
+
+    --accent: 205 40% 22%;
+    --accent-foreground: 200 60% 90%;
+
+    --destructive: 0 62% 56%;
+    --destructive-foreground: 0 0% 100%;
+
+    --ring: 221 76% 66%;
+
+    --radius: 0.625rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply h-full;
+  }
+
+  body {
+    @apply min-h-full bg-background font-sans text-foreground antialiased;
+  }
+
+  h1 {
+    @apply text-3xl font-semibold tracking-tight sm:text-4xl;
+  }
+
+  h2 {
+    @apply text-xl font-semibold tracking-tight;
+  }
+
+  h3 {
+    @apply text-base font-semibold tracking-tight;
+  }
+
+  ::selection {
+    @apply bg-primary/20;
+  }
+}
